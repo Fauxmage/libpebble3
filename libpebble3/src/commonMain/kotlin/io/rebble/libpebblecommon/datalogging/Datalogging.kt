@@ -28,7 +28,7 @@ class Datalogging(
 
     private val _customData =
         MutableSharedFlow<CustomDataLoggingEvent>(
-            extraBufferCapacity = 64,
+            extraBufferCapacity = 1024,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
     override val customData: SharedFlow<CustomDataLoggingEvent> = _customData.asSharedFlow()
@@ -83,10 +83,10 @@ class Datalogging(
             }
             return
         }
-        
+
         // Emit data for any other tags
         libPebbleCoroutineScope.launch {
-            _customData.emit(
+            _customData.tryEmit(
                 CustomDataLoggingEvent(
                     sessionId = sessionId,
                     appUuid = uuid,
