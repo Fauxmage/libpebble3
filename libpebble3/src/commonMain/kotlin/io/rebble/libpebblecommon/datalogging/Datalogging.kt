@@ -31,15 +31,16 @@ class Datalogging(
 
     private val _customData =
         MutableSharedFlow<CustomDataLoggingEvent>(
-            extraBufferCapacity = 1024,
+            extraBufferCapacity = BUFFER_CAPACITY,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
     override val customData: SharedFlow<CustomDataLoggingEvent> = _customData.asSharedFlow()
     private val sinkRef = AtomicReference<CustomDataLoggingSink?>(null)
-    private val sinkChannel = Channel<CustomDataLoggingEvent>(
-        capacity = SINK_CHANNEL_CAPACITY,
-        onBufferOverflow = BufferOverflow.SUSPEND,
-    )
+    private val sinkChannel =
+        Channel<CustomDataLoggingEvent>(
+            capacity = SINK_CHANNEL_CAPACITY,
+            onBufferOverflow = BufferOverflow.SUSPEND,
+        )
 
     init {
         libPebbleScope.launch {
@@ -107,15 +108,15 @@ class Datalogging(
             }
             return
         }
-
-        val event = CustomDataLoggingEvent(
-            sessionId = sessionId,
-            appUuid = uuid,
-            tag = tag,
-            data = data,
-            itemSize = itemSize,
-            itemsLeft = itemsLeft,
-        )
+        val event =
+            CustomDataLoggingEvent(
+                sessionId = sessionId,
+                appUuid = uuid,
+                tag = tag,
+                data = data,
+                itemSize = itemSize,
+                itemsLeft = itemsLeft,
+            )
 
         if (sinkRef.load() != null) {
             sinkChannel.send(event)
@@ -147,6 +148,7 @@ class Datalogging(
         private val MEMFAULT_CHUNKS_TAG: UInt = 86u
         private val ANALYTICS_HEARTBEAT_TAG: UInt = 87u
         private const val SINK_CHANNEL_CAPACITY = 256
+        private const val BUFFER_CAPACITY = 256
     }
 }
 
