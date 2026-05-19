@@ -442,7 +442,7 @@ class LibPebble3(
     private val vibePatternDao: VibePatternDao,
     private val watchPreferences: WatchPrefs,
     private val weatherManager: WeatherManager,
-	private val datalogging: CustomDataLogging,
+    private val datalogging: CustomDataLogging,
 ) : LibPebble, Scanning by scanning, RequestSync by webSyncManager, LockerApi by locker,
     NotificationApps by notificationApi, Calendar by phoneCalendarSyncer,
     OtherPebbleApps by otherPebbleApps, PKJSToken by jsTokenUtil, Watches by watchManager,
