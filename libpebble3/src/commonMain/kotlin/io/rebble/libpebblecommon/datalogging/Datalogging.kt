@@ -77,6 +77,8 @@ class Datalogging(
         if (uuid == SYSTEM_APP_UUID) {
             when (tag) {
                 MEMFAULT_CHUNKS_TAG -> {
+                    // A single SendDataItems payload can contain multiple items,
+                    // each itemSize bytes. Parse each one as a MemfaultChunk.
                     val size = itemSize.toInt()
                     var offset = 0
                     while (offset + size <= data.size) {
@@ -89,6 +91,7 @@ class Datalogging(
                 }
 
                 ANALYTICS_HEARTBEAT_TAG -> {
+                    // Fixed-size native_heartbeat_record items (no inner length prefix).
                     val size = itemSize.toInt()
                     if (size <= 0) {
                         logger.w { "Analytics heartbeat with itemSize=$size; ignoring" }
