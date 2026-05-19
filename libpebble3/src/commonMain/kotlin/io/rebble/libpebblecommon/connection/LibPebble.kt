@@ -88,8 +88,12 @@ data class CustomDataLoggingEvent(
     val itemsLeft: UInt,
 ) {
     override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is CustomDataLoggingEvent) return false
+        if (this === other) {
+             return true
+        }
+        if (other !is CustomDataLoggingEvent) {
+            return false
+        }
         return sessionId == other.sessionId &&
                 appUuid == other.appUuid &&
                 tag == other.tag &&
@@ -109,15 +113,14 @@ data class CustomDataLoggingEvent(
     }
 }
 
+fun interface CustomDataLoggingSink {
+    suspend fun onData(event: CustomDataLoggingEvent)
+}
+
 interface CustomDataLogging {
-    /*
-     * Emits every CustomDataLoggingEvent from any watch app whose DataLogging tag is
-     * not taken by health or Memfault. 
-     * Filter by CustomDataLoggingEvent.appUuid or .tag to isolate specific data streams.
-     */
     val customData: SharedFlow<CustomDataLoggingEvent>
         get() = _noopCustomData
-
+    fun setDataSink(sink: CustomDataLoggingSink?) {}
     companion object {
         private val _noopCustomData: SharedFlow<CustomDataLoggingEvent> = MutableSharedFlow()
     }

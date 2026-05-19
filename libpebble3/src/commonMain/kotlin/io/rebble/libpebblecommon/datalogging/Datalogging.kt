@@ -2,7 +2,11 @@ package io.rebble.libpebblecommon.datalogging
 
 import co.touchlab.kermit.Logger
 import io.rebble.libpebblecommon.SystemAppIDs.SYSTEM_APP_UUID
+import io.rebble.libpebblecommon.connection.CustomDataLogging
+import io.rebble.libpebblecommon.connection.CustomDataLoggingEvent
+import io.rebble.libpebblecommon.connection.CustomDataLoggingSink
 import io.rebble.libpebblecommon.connection.WebServices
+import io.rebble.libpebblecommon.di.LibPebbleCoroutineScope
 import io.rebble.libpebblecommon.services.WatchInfo
 import io.rebble.libpebblecommon.structmapper.SBytes
 import io.rebble.libpebblecommon.structmapper.SUInt
@@ -10,16 +14,18 @@ import io.rebble.libpebblecommon.structmapper.StructMappable
 import io.rebble.libpebblecommon.util.DataBuffer
 import io.rebble.libpebblecommon.util.Endian
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
+import kotlin.concurrent.atomics.AtomicReference
 import kotlin.uuid.Uuid
 
 class Datalogging(
     private val webServices: WebServices,
     private val healthDataProcessor: HealthDataProcessor,
-    private val libPebbleCoroutineScope: LibPebbleCoroutineScope,
+    libPebbleScope: LibPebbleCoroutineScope,
 ) : CustomDataLogging {
     private val logger = Logger.withTag("Datalogging")
 
@@ -29,8 +35,30 @@ class Datalogging(
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )
     override val customData: SharedFlow<CustomDataLoggingEvent> = _customData.asSharedFlow()
+    private val sinkRef = AtomicReference<CustomDataLoggingSink?>(null)
+    private val sinkChannel = Channel<CustomDataLoggingEvent>(
+        capacity = SINK_CHANNEL_CAPACITY,
+        onBufferOverflow = BufferOverflow.SUSPEND,
+    )
 
-    fun logData(
+    init {
+        libPebbleScope.launch {
+            for (event in sinkChannel) {
+                val sink = sinkRef.load() ?: continue
+                try {
+                    sink.onData(event)
+                } catch (e: Throwable) {
+                    logger.e(e) { "Sink threw for tag=${event.tag} uuid=${event.appUuid}" }
+                }
+            }
+        }
+    }
+
+    override fun setDataSink(sink: CustomDataLoggingSink?) {
+        sinkRef.store(sink)
+    }
+
+    suspend fun logData(
         sessionId: UByte,
         uuid: Uuid,
         tag: UInt,
@@ -49,8 +77,6 @@ class Datalogging(
         if (uuid == SYSTEM_APP_UUID) {
             when (tag) {
                 MEMFAULT_CHUNKS_TAG -> {
-                    // A single SendDataItems payload can contain multiple items,
-                    // each itemSize bytes. Parse each one as a MemfaultChunk.
                     val size = itemSize.toInt()
                     var offset = 0
                     while (offset + size <= data.size) {
@@ -63,7 +89,6 @@ class Datalogging(
                 }
 
                 ANALYTICS_HEARTBEAT_TAG -> {
-                    // Fixed-size native_heartbeat_record items (no inner length prefix).
                     val size = itemSize.toInt()
                     if (size <= 0) {
                         logger.w { "Analytics heartbeat with itemSize=$size; ignoring" }
@@ -77,21 +102,22 @@ class Datalogging(
                     }
                 }
             }
+            return
         }
-        if (uuid != SYSTEM_APP_UUID && tag == CUSTOM_DATA_TAG) {
-            libPebbleCoroutineScope.launch {
-                _customData.tryEmit(
-                    CustomDataLoggingEvent(
-                        sessionId = sessionId,
-                        appUuid = uuid,
-                        tag = tag,
-                        data = data,
-                        itemSize = itemSize,
-                        itemsLeft = itemsLeft,
-                    ),
-                )
-            }
+
+        val event = CustomDataLoggingEvent(
+            sessionId = sessionId,
+            appUuid = uuid,
+            tag = tag,
+            data = data,
+            itemSize = itemSize,
+            itemsLeft = itemsLeft,
+        )
+
+        if (sinkRef.load() != null) {
+            sinkChannel.send(event)
         }
+        _customData.tryEmit(event)
     }
 
     fun openSession(
@@ -117,7 +143,7 @@ class Datalogging(
     companion object {
         private val MEMFAULT_CHUNKS_TAG: UInt = 86u
         private val ANALYTICS_HEARTBEAT_TAG: UInt = 87u
-        private val CUSTOM_DATA_TAG: UInt = 0x0091u
+        private const val SINK_CHANNEL_CAPACITY = 256
     }
 }
 
