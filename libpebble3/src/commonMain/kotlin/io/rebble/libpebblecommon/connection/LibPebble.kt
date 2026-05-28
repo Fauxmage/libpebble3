@@ -382,6 +382,7 @@ interface NotificationApps {
         channelId: String,
         muteState: MuteState,
     )
+    fun updateNotificationAppAllowDuplicates(packageName: String, allowDuplicates: Boolean)
 
     fun notificationRulesForApp(packageName: String): Flow<List<NotificationRuleEntity>>
     fun upsertNotificationRule(rule: NotificationRuleEntity)
