@@ -6,16 +6,25 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.wrapContentHeight
 import androidx.compose.foundation.layout.wrapContentWidth
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.AlertDialogDefaults
 import androidx.compose.material3.BasicAlertDialog
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.MenuAnchorType
 import androidx.compose.material3.RadioButton
@@ -31,7 +40,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
+import coredevices.ui.dismissKeyboardOnTapOutside
 import org.koin.compose.viewmodel.koinViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -40,7 +52,7 @@ fun IndexWebhookSettingsDialog(
     viewModel: IndexWebhookSettingsViewModel = koinViewModel()
 ) {
     val urlInput by viewModel.urlInput.collectAsState()
-    val tokenInput by viewModel.tokenInput.collectAsState()
+    val headerInputs by viewModel.headerInputs.collectAsState()
     val payloadMode by viewModel.payloadModeInput.collectAsState()
     val trigger by viewModel.triggerInput.collectAsState()
     val isLinked = viewModel.isLinked
@@ -49,16 +61,29 @@ fun IndexWebhookSettingsDialog(
         onDismissRequest = viewModel::closeDialog,
     ) {
         Surface(
-            modifier = Modifier.wrapContentWidth().wrapContentHeight(),
+            // Cap the height so a long list of headers stays on screen; the
+            // title and action buttons stay fixed while the body scrolls.
+            modifier = Modifier.wrapContentWidth().heightIn(max = 600.dp)
+                .dismissKeyboardOnTapOutside(),
             shape = MaterialTheme.shapes.large,
             tonalElevation = AlertDialogDefaults.TonalElevation
         ) {
+            // Resolved inside the dialog: dialogs have their own focus manager.
+            val focusManager = LocalFocusManager.current
+            val dismissKeyboard = KeyboardActions(onDone = { focusManager.clearFocus() })
             Column(modifier = Modifier.padding(16.dp)) {
                 Text(
                     "Webhook Configuration",
                     style = MaterialTheme.typography.titleMedium
                 )
                 Spacer(modifier = Modifier.height(8.dp))
+
+                // Scrollable body so the dialog never grows past its max height.
+                Column(
+                    modifier = Modifier
+                        .weight(1f, fill = false)
+                        .verticalScroll(rememberScrollState())
+                ) {
                 Text(
                     "Send Index recording data to an HTTP endpoint on each recording.",
                     style = MaterialTheme.typography.bodySmall
@@ -72,19 +97,51 @@ fun IndexWebhookSettingsDialog(
                     singleLine = true,
                     label = { Text("Webhook URL") },
                     placeholder = { Text("https://example.com/webhook") },
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                    keyboardActions = dismissKeyboard,
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(modifier = Modifier.height(12.dp))
 
-                // Token field
-                TextField(
-                    value = tokenInput,
-                    onValueChange = viewModel::updateTokenInput,
-                    minLines = 2,
-                    maxLines = 4,
-                    label = { Text("Auth Token") },
-                    modifier = Modifier.fillMaxWidth()
+                // Headers editor
+                Text(
+                    "Headers",
+                    style = MaterialTheme.typography.labelLarge,
                 )
+                Spacer(modifier = Modifier.height(4.dp))
+                headerInputs.forEachIndexed { index, headerEntry ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        TextField(
+                            value = headerEntry.name,
+                            onValueChange = { viewModel.updateHeaderName(index, it) },
+                            singleLine = true,
+                            label = { Text("Name") },
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            keyboardActions = dismissKeyboard,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        TextField(
+                            value = headerEntry.value,
+                            onValueChange = { viewModel.updateHeaderValue(index, it) },
+                            singleLine = true,
+                            label = { Text("Value") },
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                            keyboardActions = dismissKeyboard,
+                            modifier = Modifier.weight(1f)
+                        )
+                        IconButton(onClick = { viewModel.removeHeader(index) }) {
+                            Icon(Icons.Default.Close, contentDescription = "Remove header")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                TextButton(onClick = viewModel::addHeader) {
+                    Text("Add header")
+                }
                 Spacer(modifier = Modifier.height(12.dp))
 
                 // Payload mode dropdown
@@ -148,6 +205,7 @@ fun IndexWebhookSettingsDialog(
                         }
                     }
                 }
+                } // end scrollable body
 
                 Spacer(modifier = Modifier.height(16.dp))
                 Row(modifier = Modifier.align(Alignment.End)) {

@@ -3,22 +3,16 @@ package coredevices.ring.agent.builtin_servlets.clock
 import co.touchlab.kermit.Logger
 import coredevices.indexai.util.JsonSnake
 import coredevices.mcp.BuiltInMcpTool
+import coredevices.mcp.SessionContext
 import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
-import coredevices.ring.agent.currentSessionContext
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.toJson
-import coredevices.ring.database.room.repository.ItemRepository
-import coredevices.ring.service.indexfeed.ItemFactory
-import coredevices.ring.service.indexfeed.RecordingSessionContext
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.datetime.LocalTime
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
-import org.koin.core.component.KoinComponent
-import org.koin.core.component.inject
 
 class SetAlarmTool : BuiltInMcpTool(
     definition = Tool(
@@ -50,14 +44,12 @@ class SetAlarmTool : BuiltInMcpTool(
             required = listOf("time_hours", "time_minutes")
         )
     )
-), KoinComponent {
-    private val itemRepo: ItemRepository by inject()
-    private val itemFactory: ItemFactory by inject()
+) {
 
     companion object {
         private val logger = Logger.withTag(SetAlarmTool::class.simpleName!!)
         const val TOOL_NAME = "set_alarm"
-        const val TOOL_DESCRIPTION = "Set an alarm for a specified time"
+        const val TOOL_DESCRIPTION = "Set an alarm for a specific clock time like 8am or 16:30."
     }
 
     @Serializable
@@ -69,19 +61,11 @@ class SetAlarmTool : BuiltInMcpTool(
         val label: String? = null
     )
 
-    override suspend fun call(jsonInput: String): ToolCallResult {
+    override suspend fun call(jsonInput: String, context: SessionContext): ToolCallResult {
         val setAlarmArgs = JsonSnake.decodeFromString<SetAlarmArgs>(jsonInput)
         return try {
             setAlarm(setAlarmArgs.timeHours, setAlarmArgs.timeMinutes, setAlarmArgs.label)
             val fireTime = LocalTime(hour = setAlarmArgs.timeHours, minute = setAlarmArgs.timeMinutes)
-            currentSessionContext()?.let { ctx ->
-                runCatching {
-                    itemRepo.setItem(
-                        itemFactory.simpleUid(),
-                        itemFactory.alarmItem(ctx.sourceRecordingId, ctx.createdAt, fireTime)
-                    )
-                }
-            }
             ToolCallResult(
                 "Alarm created",
                 semanticResult = SemanticResult.AlarmCreation(fireTime = fireTime)

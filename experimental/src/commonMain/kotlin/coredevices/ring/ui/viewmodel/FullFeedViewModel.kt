@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import coredevices.indexai.data.entity.LocalRecording
 import coredevices.indexai.data.entity.RecordingEntryEntity
+import coredevices.indexai.data.entity.RecordingEntryStatus
 import coredevices.ring.data.entity.room.indexfeed.CachedItem
 import coredevices.ring.data.entity.room.indexfeed.CachedList
 import coredevices.ring.data.entity.room.indexfeed.kind
@@ -13,12 +14,17 @@ import coredevices.ring.database.room.repository.ItemRepository
 import coredevices.ring.database.room.repository.ListRepository
 import coredevices.ring.database.room.repository.RecordingRepository
 import coredevices.ring.service.recordings.RecordingProcessingQueue
+import coredevices.libindex.database.dao.RingTransferDao
+import coredevices.libindex.di.LibIndexCoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.LocalDate
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.toLocalDateTime
@@ -37,7 +43,9 @@ class FullFeedViewModel(
     recordingRepo: RecordingRepository,
     itemRepo: ItemRepository,
     listRepo: ListRepository,
+    private val ringTransferDao: RingTransferDao,
     private val recordingQueue: RecordingProcessingQueue,
+    private val appScope: LibIndexCoroutineScope,
 ) : ViewModel() {
 
     val query = MutableStateFlow("")
@@ -65,6 +73,30 @@ class FullFeedViewModel(
         }
     }
 
+    fun retryRecording(recordingId: Long, entry: RecordingEntryEntity) {
+        appScope.launch {
+            val transfer = withContext(Dispatchers.IO) {
+                ringTransferDao.getByRecordingId(recordingId).firstOrNull()
+            }
+            if (transfer != null) {
+                recordingQueue.retryRecording(
+                    transferId = transfer.id,
+                    buttonSequence = null,
+                    recordingId = recordingId,
+                    recordingEntryId = entry.id,
+                )
+            } else {
+                val fileId = entry.fileName ?: return@launch
+                recordingQueue.retryLocalRecording(
+                    fileId = fileId,
+                    buttonSequence = null,
+                    recordingId = recordingId,
+                    recordingEntryId = entry.id,
+                )
+            }
+        }
+    }
+
     data class UiState(val entries: List<Entry>) {
         companion object { fun empty() = UiState(emptyList()) }
     }
@@ -79,6 +111,7 @@ class FullFeedViewModel(
         data class RecordingRow(
             val recording: LocalRecording,
             val transcription: String,
+            val retryEntry: RecordingEntryEntity?,
             val assistantReply: String?,
             val chips: List<Chip>,
         ) : Entry() {
@@ -106,10 +139,7 @@ class FullFeedViewModel(
             val itemsByRecording = items
                 .filter { !it.deleted }
                 .groupBy { it.sourceRecordingId.orEmpty() }
-            // First entry transcription per recording (ordered by timestamp ASC).
-            val transcriptionByRec = entries
-                .groupBy { it.recordingId }
-                .mapValues { (_, es) -> es.firstOrNull()?.transcription.orEmpty() }
+            val entriesByRec = entries.groupBy { it.recordingId }
 
             val sorted = recordings.sortedBy { it.localTimestamp.toEpochMilliseconds() }
 
@@ -119,7 +149,12 @@ class FullFeedViewModel(
             val out = mutableListOf<Entry>()
             var lastDay: LocalDate? = null
             for (r in sorted) {
-                val transcription = transcriptionByRec[r.id].orEmpty()
+                val recordingEntries = entriesByRec[r.id].orEmpty()
+                    .sortedWith(compareBy<RecordingEntryEntity> { it.timestamp }.thenBy { it.id })
+                val latestEntry = recordingEntries.lastOrNull()
+                val transcription = latestEntry?.transcription?.takeIf { it.isNotBlank() }
+                    ?: recordingEntries.firstOrNull()?.transcription.orEmpty()
+                val retryEntry = latestEntry?.takeIf { it.isRetryableTranscriptionFailure() }
                 val matchedRec = match(r.assistantTitle) || match(transcription)
                 val recItems = itemsByRecording[r.firestoreId.orEmpty()].orEmpty() +
                     itemsByRecording["local:${r.id}"].orEmpty()
@@ -137,12 +172,15 @@ class FullFeedViewModel(
                 out += Entry.RecordingRow(
                     recording = r,
                     transcription = transcription,
+                    retryEntry = retryEntry,
                     assistantReply = null, // wire when we mirror assistantReply onto LocalRecording
                     chips = recItems.take(8).map { item ->
                         Chip(
                             itemId = item.firestoreId,
+                            // chipLabel already yields "🔒 Encrypted" for locked
+                            // rows; drop the kind glyph so the lock isn't doubled.
                             label = IndexFeedViewModel.chipLabel(item, lists).take(64),
-                            glyph = chipGlyph(item.kind),
+                            glyph = if (item.locked) "" else chipGlyph(item.kind),
                         )
                     },
                 )
@@ -158,8 +196,13 @@ class FullFeedViewModel(
             "answer" -> "✨"
             "message" -> "✉"
             "action_log" -> "✉"
+            "delegated" -> "✉"
+            "calendar_event" -> "📅"
             else -> "•"
         }
+
+        private fun RecordingEntryEntity.isRetryableTranscriptionFailure(): Boolean =
+            status == RecordingEntryStatus.transcription_error
 
         /** Calendar-day-aware label for a day divider. */
         private fun dayLabel(today: LocalDate, recDay: LocalDate): String {

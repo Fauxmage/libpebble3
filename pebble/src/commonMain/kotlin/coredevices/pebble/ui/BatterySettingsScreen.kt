@@ -28,13 +28,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import co.touchlab.kermit.Logger
-import com.multiplatform.webview.web.LoadingState
-import com.multiplatform.webview.web.WebView
-import com.multiplatform.webview.web.rememberWebViewNavigator
-import com.multiplatform.webview.web.rememberWebViewState
 import com.russhwolf.settings.Settings
 import coredevices.pebble.ui.SettingsKeys.KEY_ENABLE_MEMFAULT_UPLOADS
 import coredevices.ui.PebbleElevatedButton
+import coredevices.ui.PebbleWebview
+import coredevices.ui.PebbleWebviewNavigator
+import coredevices.ui.PebbleWebviewUrlInterceptor
 import coredevices.ui.SignInDialog
 import coredevices.util.emailOrNull
 import dev.gitlive.firebase.Firebase
@@ -147,11 +146,28 @@ fun BatterySettingsScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
         return
     }
 
-    val state = rememberWebViewState(currentUrl)
-    val navigator = rememberWebViewNavigator()
-    LaunchedEffect(Unit) {
+    var pageError by remember { mutableStateOf<String?>(null) }
+    // Clear any prior failure when the target URL changes (e.g. sign-in or token refresh).
+    LaunchedEffect(currentUrl) { pageError = null }
+
+    if (pageError != null) {
+        Logger.withTag("BatterySettingsScreen").w { "Battery page failed to load: $pageError" }
+        BatteryLoadErrorContent(onRetry = { pageError = null })
+        LaunchedEffect(Unit) {
+            topBarParams.actions { }
+        }
+        return
+    }
+
+    val interceptor = remember {
+        object : PebbleWebviewUrlInterceptor {
+            override var navigator: PebbleWebviewNavigator? = null
+            override fun onIntercept(url: String, navigator: PebbleWebviewNavigator) = true
+        }
+    }
+    LaunchedEffect(interceptor) {
         topBarParams.actions {
-            IconButton(onClick = { navigator.reload() }) {
+            IconButton(onClick = { interceptor.navigator?.reload() }) {
                 Icon(Icons.Default.Refresh, contentDescription = "Refresh")
             }
         }
@@ -161,14 +177,12 @@ fun BatterySettingsScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
             .fillMaxSize()
             .background(MaterialTheme.colorScheme.background),
     ) {
-        WebView(
-            state = state,
+        PebbleWebview(
+            url = currentUrl,
+            interceptor = interceptor,
             modifier = Modifier.fillMaxSize(),
-            navigator = navigator,
+            onPageError = { pageError = it },
         )
-        if (state.loadingState is LoadingState.Loading) {
-            LinearProgressIndicator(Modifier.fillMaxWidth().height(2.dp))
-        }
     }
 }
 
@@ -206,6 +220,30 @@ private fun SignedOutBatteryContent(onSignIn: () -> Unit) {
         PebbleElevatedButton(
             onClick = onSignIn,
             text = "Sign in",
+            primaryColor = true,
+        )
+    }
+}
+
+@Composable
+private fun BatteryLoadErrorContent(onRetry: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            "Couldn't load your Battery usage. Check your connection and try again.",
+            style = MaterialTheme.typography.bodyLarge,
+            textAlign = TextAlign.Center,
+        )
+        Box(Modifier.height(12.dp))
+        PebbleElevatedButton(
+            onClick = onRetry,
+            text = "Retry",
             primaryColor = true,
         )
     }

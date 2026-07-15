@@ -11,17 +11,21 @@ import coredevices.indexai.database.dao.ConversationMessageDao
 import coredevices.indexai.database.dao.RecordingEntryDao
 import coredevices.util.transcription.TranscriptionService
 import coredevices.util.transcription.TranscriptionSessionStatus
+import coredevices.mcp.SessionContext
 import coredevices.mcp.client.McpSession
+import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
 import coredevices.util.transcription.STTLanguage
 import coredevices.ring.agent.AgentNetworkException
 import coredevices.ring.data.entity.room.TraceEventData
+import coredevices.libindex.database.repository.RingTransferRepository
+import coredevices.ring.database.room.dao.LocalReminderDao
 import coredevices.ring.database.room.repository.ItemRepository
 import coredevices.ring.database.room.repository.RecordingRepository
 import coredevices.ring.service.indexfeed.ItemFactory
-import coredevices.ring.service.indexfeed.RecordingSessionContext
 import coredevices.ring.util.trace.RingTraceSession
 import coredevices.util.queue.RecoverableTaskException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
@@ -43,6 +47,8 @@ import kotlinx.io.Source
 import kotlinx.io.readByteArray
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.minutes
+import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 import kotlin.uuid.Uuid
 
 class RecordingProcessor(
@@ -53,7 +59,9 @@ class RecordingProcessor(
     private val coreConfigFlow: CoreConfigFlow,
     private val itemRepo: ItemRepository,
     private val recordingRepo: RecordingRepository,
+    private val transferRepository: RingTransferRepository,
     private val itemFactory: ItemFactory,
+    private val localReminderDao: LocalReminderDao,
 ) {
     sealed interface RecordingStatus {
         /**
@@ -81,7 +89,7 @@ class RecordingProcessor(
 
     companion object {
         private const val AUDIO_STREAM_BUFFER_SIZE = 1024
-        private val TRANSCRIPTION_TIMEOUT = 2.minutes
+        internal val TRANSCRIPTION_TIMEOUT = 45.seconds
         private val logger = Logger.withTag("RecordingProcessor")
     }
 
@@ -100,18 +108,22 @@ class RecordingProcessor(
         }
     }
 
+    // transcriptionService.transcribe(...) returns a cold flow; the timeout that bounds the
+    // (blocking) transcription is applied by the caller around collection (see RecordingOperation),
+    // because a timeout wrapped around building the cold flow expires instantly and bounds nothing.
     private suspend fun transcriptionStep(
-        transcriptionTimeout: Duration,
         audioStreamFlow: Flow<ByteArray>,
         sampleRate: Int,
         language: STTLanguage,
-        encoding: AudioEncoding
+        encoding: AudioEncoding,
+        dictionaryContext: List<String>? = null,
     ) = transcriptionService.transcribe(
         audioStreamFlow,
         sampleRate,
         language = language,
         encoding = encoding,
-        timeout = transcriptionTimeout
+        dictionaryContext = dictionaryContext,
+        initialTimeout = TRANSCRIPTION_TIMEOUT,
     ).flowOn(Dispatchers.IO)
 
     private suspend fun updateRecordingEntryMessage(entryId: Long, messageId: Long) {
@@ -180,7 +192,8 @@ class RecordingProcessor(
     suspend fun transcribe(
         audioSource: Source,
         sampleRate: Int,
-        encoding: AudioEncoding = AudioEncoding.PCM_16BIT
+        encoding: AudioEncoding = AudioEncoding.PCM_16BIT,
+        dictionaryContext: List<String>? = null
     ): Flow<TranscriptionSessionStatus> {
         val audioStreamFlow = flow {
             audioSource.use {
@@ -198,10 +211,10 @@ class RecordingProcessor(
         }.flowOn(Dispatchers.IO)
 
         return transcriptionStep(
-            transcriptionTimeout = TRANSCRIPTION_TIMEOUT,
             audioStreamFlow = audioStreamFlow,
             sampleRate = sampleRate,
             encoding = encoding,
+            dictionaryContext = dictionaryContext,
             language = STTLanguage.fromCodeOrAutomatic(coreConfigFlow.value.sttConfig.spokenLanguage),
         )
     }
@@ -211,13 +224,27 @@ class RecordingProcessor(
         recordingEntryId: Long?,
         mcpSession: McpSession,
         agent: Agent,
-        forcedTool: (suspend () -> ToolCallResult)? = null,
+        forcedTool: (suspend (assistantMessage: String?, sessionContext: SessionContext) -> ToolCallResult)? = null,
         text: String
     ) {
         val rec = withContext(Dispatchers.IO) { recordingRepo.getRecording(recordingId) }
         val firestoreId = rec?.firestoreId
         val createdAt = rec?.localTimestamp ?: Clock.System.now()
-        val sessionContext = firestoreId?.let { RecordingSessionContext(it, createdAt) }
+        // Ring recordings only have a true recording time when the ring reported the button
+        // press; other sources (chat, phone mic) stamp the recording at capture time.
+        val ringTransfer = withContext(Dispatchers.IO) {
+            transferRepository.getTransfersByRecordingId(recordingId).firstOrNull()
+        }
+        val timeBase = if (ringTransfer != null) {
+            ringTransfer.transferInfo?.buttonReleased?.let { Instant.fromEpochMilliseconds(it) }
+        } else {
+            createdAt
+        }
+        val sessionContext = SessionContext(
+            timeBase = timeBase,
+            userMessageText = CompletableDeferred(text),
+            recordingFirestoreId = firestoreId,
+        )
 
         trace.markEvent("agent_processing_start",
             TraceEventData.AgentProcessingStart(
@@ -236,9 +263,7 @@ class RecordingProcessor(
             recordingEntryId
         )
         try {
-            withContext(if (sessionContext != null) currentCoroutineContext() + sessionContext else currentCoroutineContext()) {
-                agent.send(text, mcpSession)
-            }
+            agent.send(text, mcpSession, sessionContext)
         } catch (e: AgentNetworkException) {
             // Reset conversation to before processing so task retry works correctly
             logger.e(e) { "Error during agent processing" }
@@ -259,12 +284,20 @@ class RecordingProcessor(
             updateConversation(recordingId, agent.conversation.first().take(convEndIdx))
         }
         val conv = agent.conversation.firstOrNull() ?: emptyList()
-        val noToolRan = conv.drop(convEndIdx).all { it.role != MessageRole.tool }
-        if (forcedTool != null && noToolRan) {
+        // No tool messages
+        val noToolRan = conv.drop(convEndIdx).none {
+            it.role == MessageRole.tool
+        }
+        // Last tool message indicates fallback was requested
+        val toolRequestedFallback = conv.drop(convEndIdx).lastOrNull { it.role == MessageRole.tool }?.let {
+            it.semantic_result is SemanticResult.GenericFailure && (it.semantic_result as SemanticResult.GenericFailure).forceFallbackTool
+        } ?: false
+        if (forcedTool != null && (noToolRan || toolRequestedFallback)) {
+            val lastAssistantMessage = conv.drop(convEndIdx)
+                .lastOrNull { it.role == MessageRole.assistant }
+                ?.content
             // Agent did not take any action, force tool
-            val toolResult = withContext(if (sessionContext != null) currentCoroutineContext() + sessionContext else currentCoroutineContext()) {
-                forcedTool()
-            }
+            val toolResult = forcedTool(lastAssistantMessage, sessionContext)
             logger.w { "Forcing tool call result into conversation" }
             agent.addMessage(
                 ConversationMessageDocument(
@@ -276,6 +309,21 @@ class RecordingProcessor(
                     is_forced_tool = true
                 )
             )
+        }
+        // Create feed items from this turn's tool messages, stamping each with the tool_call_id
+        // that produced it. Done centrally (rather than in each tool) because only the tool message
+        // carries the tool_call_id.
+        if (firestoreId != null) {
+            agent.conversation.first().drop(convEndIdx)
+                .filter { it.role == MessageRole.tool }
+                .forEach { msg ->
+                    val item = msg.semantic_result?.let {
+                        itemFactory.createFromSemanticResult(it, firestoreId, createdAt, msg.tool_call_id)
+                    } ?: return@forEach
+                    val itemId = itemFactory.simpleUid()
+                    runCatching { itemRepo.setItem(itemId, item) }
+                        .onFailure { logger.e(it) { "Failed to persist item for tool_call ${msg.tool_call_id}" } }
+                }
         }
         updateConversation(recordingId, agent.conversation.first())
         linkUserMessageToEntry(recordingId, recordingEntryId)

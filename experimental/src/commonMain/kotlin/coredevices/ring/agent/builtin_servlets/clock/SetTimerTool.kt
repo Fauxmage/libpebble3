@@ -5,9 +5,10 @@ import coredevices.indexai.time.HumanDateTimeParser
 import coredevices.indexai.time.InterpretedDateTime
 import coredevices.indexai.util.JsonSnake
 import coredevices.mcp.BuiltInMcpTool
+import coredevices.mcp.SessionContext
+import coredevices.mcp.asFrozenClock
 import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
-import coredevices.ring.agent.currentSessionContext
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.toJson
@@ -21,12 +22,6 @@ import kotlinx.serialization.EncodeDefault
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
-import coredevices.ring.database.room.repository.ItemRepository
-import coredevices.ring.service.indexfeed.ItemFactory
-import coredevices.ring.service.indexfeed.RecordingSessionContext
-import kotlinx.coroutines.currentCoroutineContext
-import org.koin.core.component.KoinComponent
-import org.koin.core.component.inject
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.days
@@ -53,9 +48,7 @@ class SetTimerTool : BuiltInMcpTool(
     extraContext = """
         When using the 'set_timer' tool, lean towards setting timers for durations when it's ambiguous, for example a timer for '3:20' should be set for '3 hours and 20 minutes' not 'at 3:20'.
     """.trimIndent()
-), KoinComponent {
-    private val itemRepo: ItemRepository by inject()
-    private val itemFactory: ItemFactory by inject()
+) {
     companion object {
         private val logger = Logger.withTag(SetTimerTool::class.simpleName!!)
         const val TOOL_NAME = "set_timer"
@@ -118,12 +111,15 @@ class SetTimerTool : BuiltInMcpTool(
         val errorMessage: String? = null,
     )
 
-    override suspend fun call(jsonInput: String): ToolCallResult {
+    override suspend fun call(jsonInput: String, context: SessionContext): ToolCallResult {
         val setTimerArgs = JsonSnake.decodeFromString<SetTimerArgs>(jsonInput)
         val tz = TimeZone.currentSystemDefault()
-        val now = Clock.System.now()
-        val parser = HumanDateTimeParser()
-        val fireTime = parser.parse(setTimerArgs.timeHuman)?.let { interpretedTimeToFireTime(it, now, tz) }
+        // The timer should end relative to when the user actually spoke. When that's unknown,
+        // only absolute end times can fall back to the current clock; durations are refused.
+        val timeBase = context.timeBase
+        val anchor = timeBase ?: Clock.System.now()
+        val parser = HumanDateTimeParser(clock = anchor.asFrozenClock())
+        val interpreted = parser.parse(setTimerArgs.timeHuman)
             ?: return ToolCallResult(
                 JsonSnake.encodeToString(
                     SetTimerResult(
@@ -133,7 +129,23 @@ class SetTimerTool : BuiltInMcpTool(
                 ),
                 SemanticResult.GenericFailure("Could not parse time: '${setTimerArgs.timeHuman}'", llmRecoverable = true)
             )
-        val duration = fireTime - now
+        if (timeBase == null && interpreted is InterpretedDateTime.Relative) {
+            return ToolCallResult(
+                JsonSnake.encodeToString(
+                    SetTimerResult(
+                        success = false,
+                        errorMessage = "Cannot set a timer for a duration: the recording's original time is unknown"
+                    )
+                ),
+                SemanticResult.GenericFailure(
+                    "Couldn't determine when the recording was made",
+                    llmRecoverable = false
+                )
+            )
+        }
+        val fireTime = interpretedTimeToFireTime(interpreted, anchor, tz)
+        // Remaining time from the actual present, so processing delay doesn't shift the end time
+        val duration = fireTime - Clock.System.now()
         if (duration.isNegative()) {
             return ToolCallResult(
                 JsonSnake.encodeToString(
@@ -142,29 +154,21 @@ class SetTimerTool : BuiltInMcpTool(
                         errorMessage = "Specified time is in the past"
                     )
                 ),
-                SemanticResult.GenericFailure("Specified time is in the past", llmRecoverable = true)
+                SemanticResult.GenericFailure("Specified time is in the past", llmRecoverable = false)
             )
         }
         return try {
             setTimer(duration)
             val actualFireTime = Clock.System.now() + duration
-            currentSessionContext()?.let { ctx ->
-                runCatching {
-                    itemRepo.setItem(
-                        itemFactory.simpleUid(),
-                        itemFactory.timerItem(ctx.sourceRecordingId, ctx.createdAt, actualFireTime, duration)
-                    )
-                }
-            }
             ToolCallResult(
                 JsonSnake.encodeToString(SetTimerResult(success = true)),
-                SemanticResult.TimerCreation(duration, actualFireTime)
+                SemanticResult.TimerCreation(fireTime - anchor, actualFireTime)
             )
         } catch (e: Exception) {
             logger.e(e) { "Failed to set timer via tool" }
             ToolCallResult(
                 JsonSnake.encodeToString(SetTimerResult(success = false, errorMessage = e.message)),
-                SemanticResult.GenericFailure("Failed to set timer: ${e.message}")
+                SemanticResult.GenericFailure("Failed: ${e.message}")
             )
         }
     }

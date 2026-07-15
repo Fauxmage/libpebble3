@@ -66,7 +66,9 @@ class PKJSApp(
     val uuid: Uuid by lazy { Uuid.parse(appInfo.uuid) }
     private var jsRunner: JsRunner? = null
     private var runningScope: CoroutineScope? = null
-    private val urlOpenRequests = Channel<String>(Channel.RENDEZVOUS)
+    // Buffered so JS-side `loadUrl(...).trySend(url)` can't silently drop the URL when the
+    // receiver in requestConfigurationUrl() hasn't yet reached `receive()`.
+    private val urlOpenRequests = Channel<String>(capacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
 
     private val _logMessages = Channel<String>(2, BufferOverflow.DROP_OLDEST)
     val logMessages: ReceiveChannel<String> = _logMessages
@@ -142,16 +144,31 @@ class PKJSApp(
             logger.e { "Cannot show configuration, PKJSApp is not running" }
             return null
         }
+        val jsRunner = jsRunner
+        if (jsRunner == null) {
+            logger.e { "JsRunner not initialized, cannot show configuration" }
+            return null
+        }
+        // globalThis.signalShowConfiguration is only defined once the JS startup script has
+        // finished evaluating (readyState -> true). Calling it before then throws
+        // "signalShowConfiguration is not a function" and the settings page fails to open
+        // on the first tap right after launch. Wait for readiness first, mirroring the
+        // incoming app message handler.
+        if (!jsRunner.readyState.value) {
+            logger.w { "JsRunner not ready, waiting before requesting configuration URL" }
+            val ready = withTimeoutOrNull(6.seconds) {
+                jsRunner.readyState.first { it }
+            } ?: false
+            if (!ready) {
+                logger.e { "JsRunner still not ready, cannot show configuration" }
+                return null
+            }
+        }
+        // Drop any stale URL that the JS may have queued spontaneously before this call.
+        while (urlOpenRequests.tryReceive().isSuccess) { /* discard */ }
         val url = runningScope!!.async { urlOpenRequests.receive() }
         try {
-            val jsRunner = jsRunner
-            if (jsRunner != null) {
-               jsRunner.signalShowConfiguration()
-            } else {
-               logger.e { "JsRunner not initialized, cannot show configuration" }
-               url.cancel()
-               return null
-            }
+            jsRunner.signalShowConfiguration()
         } catch (e: Exception) {
             url.cancel()
             logger.e(e) { "Error signalling show configuration" }

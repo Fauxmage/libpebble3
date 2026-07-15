@@ -126,6 +126,7 @@ import coredevices.analytics.CoreAnalytics
 import coredevices.firestore.UsersDao
 import coredevices.libindex.IndexDevices
 import coredevices.libindex.LibIndex
+import coredevices.pebble.PebbleDeepLinkHandler
 import coredevices.libindex.device.DiscoveredIndexDevice
 import coredevices.libindex.device.IndexDevice
 import coredevices.libindex.device.KnownIndexDevice
@@ -139,6 +140,7 @@ import coredevices.libindex.ui.components.PressPatternDot
 import coredevices.pebble.PebbleFeatures
 import coredevices.pebble.account.PebbleAccount
 import coredevices.pebble.firmware.FirmwareUpdateUiTracker
+import coredevices.pebble.firmware.isCoreDevice
 import coredevices.pebble.rememberLibPebble
 import coredevices.pebble.services.LanguagePack
 import coredevices.pebble.services.LanguagePackRepository
@@ -239,6 +241,12 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
     val scope = rememberCoroutineScope()
     val permissionRequester: PermissionRequester = koinInject()
     val requiredScanPermission = remember { scanPermission() }
+
+    val companionDevice = koinInject<CompanionDevice>()
+    val deepLinkHandler = koinInject<PebbleDeepLinkHandler>()
+    val screenUiContext = rememberUiContext()
+    val requestIndexCompanion by deepLinkHandler.requestIndexCompanion.collectAsState()
+
     val bluetoothEnabled by libPebble.bluetoothEnabled.collectAsState()
     var addFabExpanded by remember { mutableStateOf(false) }
     val indexAlreadyPaired by libIndex.rings.map { rings -> rings.any { it !is DiscoveredIndexDevice } }
@@ -252,6 +260,20 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
             delay(15_000)
             showRingWakeHint = true
         }
+    }
+
+    suspend fun requestCDMForInactiveIndex(uiContext: PlatformUiContext, identifier: IndexIdentifier) {
+        topBarParams.showSnackbar("Press the button on your Index 01 so this device can find it...")
+        companionDevice.registerDevice(identifier, uiContext)
+    }
+
+    LaunchedEffect(requestIndexCompanion) {
+        if (!requestIndexCompanion) return@LaunchedEffect
+        val pairedRing = libIndex.rings.value.firstOrNull { it is KnownIndexDevice }
+        if (screenUiContext != null && pairedRing != null) {
+            requestCDMForInactiveIndex(screenUiContext, (pairedRing as KnownIndexDevice).identifier)
+        }
+        deepLinkHandler.consumeRequestIndexCompanion()
     }
 
     suspend fun ensureScanPermission(uiContext: PlatformUiContext): Boolean {
@@ -404,7 +426,7 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
 
                 if (firmwareUpdateUiTracker.shouldUiUpdateCheck()) {
                     firmwareUpdateUiTracker.didFirmwareUpdateCheckFromUi()
-                    libPebble.checkForFirmwareUpdates()
+                    libPebble.checkForFirmwareUpdates(false)
                 }
             }
 
@@ -486,6 +508,14 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
                         text = "Scanning for devices...",
                         modifier = Modifier.align(Alignment.CenterHorizontally).padding(5.dp)
                     )
+                    if (scanningStatus == ScanningStatus.ScanningRing) {
+                        Text(
+                            text = "Press the button on your Index 01 to wake it.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.align(Alignment.CenterHorizontally).padding(horizontal = 16.dp)
+                        )
+                    }
                     CircularProgressIndicator(
                         modifier = Modifier.align(Alignment.CenterHorizontally).padding(5.dp)
                     )
@@ -567,6 +597,9 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
                             is DeviceListEntry.Ring -> RingItem(
                                 ring = entry.device,
                                 scope = scope,
+                                onRequestCompanion = { identifier ->
+                                    screenUiContext?.let { requestCDMForInactiveIndex(it, identifier) }
+                                },
                             )
                         }
                         if (index < entries.lastIndex) {
@@ -609,6 +642,13 @@ fun WatchesScreen(navBarNav: NavBarNav, topBarParams: TopBarParams) {
                         "You'll see the light flash red green blue repeatedly when successful.",
                         modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp)
                     )
+                    val uriHandler = LocalUriHandler.current
+                    TextButton(
+                        onClick = { uriHandler.openUri("https://help.repebble.com/en/articles/15724430-hard-resets-how-to-fix-most-problems-on-index-01") },
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
+                        Text("Need more help? View detailed instructions")
+                    }
                 }
             },
             confirmButton = {
@@ -666,6 +706,7 @@ fun WatchesPreview() {
                                 override val identifier = IndexIdentifier("1234")
                                 override val name = "Index 01"
                                 override val rssi = -50
+                                override val isFailsafe: Boolean = false
                                 override val pairingState: IndexPairingState =
                                     IndexPairingState.NotPaired
 
@@ -686,6 +727,10 @@ fun WatchesPreview() {
                             }
                         )
                     )
+
+                    override fun warnIfNoCompanionAssociations() {
+
+                    }
 
                     override fun init(bluetoothPermissionChanged: Flow<Boolean>) {
                         TODO("Not yet implemented")
@@ -715,7 +760,7 @@ sealed interface DeviceListEntry {
     val key: String
 
     data class Watch(val device: PebbleDevice) : DeviceListEntry {
-        override val key get() = "watch-${device.identifier.asString}"
+        override val key get() = "watch-${device.identifier::class.simpleName}-${device.identifier.asString}"
     }
 
     data class Ring(val device: IndexDevice) : DeviceListEntry {
@@ -724,10 +769,19 @@ sealed interface DeviceListEntry {
 }
 
 @Composable
-fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
+fun RingItem(
+    ring: IndexDevice,
+    scope: CoroutineScope,
+    onRequestCompanion: suspend (IndexIdentifier) -> Unit = {},
+) {
     val coreAnalytics = koinInject<CoreAnalytics>()
     val platform = koinInject<Platform>()
+    val companionDevice = koinInject<CompanionDevice>()
+    val uiContext = rememberUiContext()
     var showRingAlreadyPairedDialog by remember { mutableStateOf(false) }
+    var companionApproved by remember(ring.identifier) {
+        mutableStateOf(companionDevice.hasApprovedDevice(ring.identifier))
+    }
     ListItem(
         headlineContent = {
             Text(
@@ -738,7 +792,11 @@ fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
         },
         supportingContent = {
             val stateText = when (ring) {
-                is DiscoveredIndexDevice -> "Available to pair"
+                is DiscoveredIndexDevice -> if (ring.isFailsafe) {
+                    "Failsafe mode"
+                } else {
+                    "Available to pair"
+                }
                 is InterviewedIndexDevice if (ring.updating) -> "Updating..."
                 else -> "Ready"
             }
@@ -777,8 +835,10 @@ fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
                     }
                     if (ring.pairingState is IndexPairingState.Error || ring.pairingState is IndexPairingState.NotPaired) {
                         Button(
+                            enabled = !ring.isFailsafe,
                             onClick = {
                                 scope.launch {
+                                    uiContext?.let { companionDevice.registerDevice(ring.identifier, it) }
                                     val result = try {
                                         ring.pair()
                                     } catch (e: Exception) {
@@ -797,6 +857,9 @@ fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
                                                 showRingAlreadyPairedDialog = true
                                             }
                                         }
+                                        is IndexPairingResult.EraseFailed -> {
+                                            coreAnalytics.logEvent("ring.pair_failed", mapOf("reason" to "erase_failed"))
+                                        }
                                         null -> {
                                             coreAnalytics.logEvent("ring.pair_failed", mapOf("reason" to "bonding_error"))
                                         }
@@ -814,6 +877,27 @@ fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
                             .fillMaxWidth()
                             .padding(vertical = 6.dp)
                     )
+                }
+                if (ring is KnownIndexDevice && !companionApproved) {
+                    Text(
+                        text = "Limited background access",
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 14.sp,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                onRequestCompanion(ring.identifier)
+                                // Re-check once the system association dialog resolves so the
+                                // warning clears if the user approved it.
+                                companionApproved = companionDevice.hasApprovedDevice(ring.identifier)
+                            }
+                        },
+                        modifier = Modifier.padding(top = 5.dp),
+                    ) {
+                        Text("Enable background access")
+                    }
                 }
             }
         },
@@ -867,6 +951,13 @@ fun RingItem(ring: IndexDevice, scope: CoroutineScope) {
                     )
                     Text("Short (3 times) LONG (1 second, 3 times) short (3 times)", modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp) )
                     Text("You'll see the light flash red green blue repeatedly when successful.", modifier = Modifier.align(Alignment.CenterHorizontally).padding(top = 8.dp) )
+                    val uriHandler = LocalUriHandler.current
+                    TextButton(
+                        onClick = { uriHandler.openUri("https://help.repebble.com/en/articles/15724430-hard-resets-how-to-fix-most-problems-on-index-01") },
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) {
+                        Text("Need more help? View detailed instructions")
+                    }
                 }
             },
             confirmButton = {
@@ -1204,7 +1295,7 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
                             Icon(Icons.Outlined.Autorenew, contentDescription = null)
                         },
                         onClick = {
-                            watch.checkforFirmwareUpdate()
+                            watch.checkforFirmwareUpdate(true)
                         }
                     )
                 }
@@ -1213,7 +1304,8 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
             HorizontalDivider()
 
             if (watch is ConnectedPebbleDevice) {
-                val languagePackInstalled = watch.languagePackInstalled()
+                val languagePackRepository: LanguagePackRepository = koinInject()
+                val languagePackInstalled = watch.languagePackInstalled(languagePackRepository)
                 val languageText = when  {
                     languagePackInstalled.isNullOrBlank() -> "Language"
                     else -> "Language: $languagePackInstalled"
@@ -1245,6 +1337,22 @@ fun WatchMenu(watch: PebbleDevice, navBarNav: NavBarNav) {
                         showScreenshotDialog = true
                     }
                 )
+
+                if (watch.watchInfo.platform.isCoreDevice()) {
+                    DropdownMenuItem(
+                        text = { Text("Battery Life") },
+                        leadingIcon = {
+                            Icon(
+                                Icons.Default.BatteryFull,
+                                contentDescription = null
+                            )
+                        },
+                        onClick = {
+                            showMenu = false
+                            navBarNav.navigateTo(PebbleNavBarRoutes.BatterySettingsRoute)
+                        }
+                    )
+                }
                 HorizontalDivider()
             }
 
@@ -1575,10 +1683,10 @@ data class TestNotificationContent(
     val color: TimelineColor? = TimelineColor.Orange,
 )
 
-fun ConnectedPebbleDevice.languagePackInstalled(): String? {
+fun ConnectedPebbleDevice.languagePackInstalled(repository: LanguagePackRepository): String? {
     val languagePackInstalledAtConnectionTime = installedLanguagePack
     val languagePackRecentlyInstalledSinceConnection = (languagePackInstallState as? LanguagePackInstallState.Idle)?.successfullyInstalledLanguage
-    return languagePackRecentlyInstalledSinceConnection ?: languagePackInstalledAtConnectionTime?.let { "${it.isoLocal} (v${it.version})" }
+    return languagePackRecentlyInstalledSinceConnection ?: languagePackInstalledAtConnectionTime?.let { repository.displayNameForInstalled(it) }
 }
 
 private const val CUSTOM_NOTIFICATION_CONTENT_KEY = "custom_notification_content"
@@ -2014,6 +2122,18 @@ fun WatchDetails(
                     "in watch settings (Settings > Bluetooth), then accept the new pairing request.",
         )
     }
+    if (watch !is CommonConnectedDevice && failureInfo?.reason == ConnectionFailureReason.MalformedConnectivityStatus) {
+        ConnectionFailureGuidanceButton(
+            appContext = appContext,
+            pebbleFeatures = pebbleFeatures,
+            buttonText = "Error Connecting - Restart Your Watch",
+            dialogTitle = "Restart your watch",
+            dialogText = "Your watch needs to be restarted before it can connect. " +
+                    "Press and hold the back button (top-left) for about 15 seconds " +
+                    "until the watch restarts, then try connecting again.",
+            showBluetoothSettingsLink = false,
+        )
+    }
     Row {
         Box(modifier = Modifier.weight(1f)) {
             if (watch is ActiveDevice) {
@@ -2053,9 +2173,10 @@ private fun ConnectionFailureGuidanceButton(
     buttonText: String,
     dialogTitle: String,
     dialogText: String,
+    showBluetoothSettingsLink: Boolean = true,
 ) {
     var showDialog by remember { mutableStateOf(false) }
-    val canDeepLink = pebbleFeatures.supportsLinkingToOsBtSettings()
+    val canDeepLink = showBluetoothSettingsLink && pebbleFeatures.supportsLinkingToOsBtSettings()
     if (showDialog) {
         AlertDialog(
             onDismissRequest = { showDialog = false },

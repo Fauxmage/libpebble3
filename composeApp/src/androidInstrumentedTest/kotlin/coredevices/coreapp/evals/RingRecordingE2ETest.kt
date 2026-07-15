@@ -11,7 +11,8 @@ import coredevices.indexai.database.dao.ConversationMessageDao
 import coredevices.indexai.database.dao.RecordingEntryDao
 import coredevices.util.CommonBuildKonfig as CBK
 import coredevices.ring.agent.AgentFactory
-import coredevices.ring.agent.AgentNenya
+import coredevices.ring.agent.IndexAgentNenya
+import coredevices.ring.agent.SearchAgentNenya
 import coredevices.ring.agent.BuiltinServletRepository
 import coredevices.ring.agent.McpSessionFactory
 import coredevices.ring.agent.builtin_servlets.notes.NoteProvider
@@ -29,7 +30,6 @@ import coredevices.ring.database.room.dao.RecordingProcessingTaskDao
 import coredevices.ring.database.room.repository.McpSandboxRepository
 import coredevices.ring.database.room.repository.RecordingProcessingTaskRepository
 import coredevices.ring.database.room.repository.RecordingRepository
-import coredevices.ring.database.room.repository.RingTransferRepository
 import coredevices.ring.encryption.DocumentEncryptor
 import coredevices.ring.encryption.EncryptionKeyManager
 import coredevices.ring.external.indexwebhook.IndexWebhookApi
@@ -39,6 +39,7 @@ import coredevices.ring.service.recordings.RecordingPreprocessor
 import coredevices.ring.service.recordings.RecordingProcessingQueue
 import coredevices.ring.service.recordings.RecordingProcessor
 import coredevices.ring.service.recordings.button.RecordingOperationFactory
+import coredevices.ring.storage.RealRecordingStorage
 import coredevices.ring.storage.RecordingStorage
 import coredevices.ring.util.trace.RingTraceSession
 import coredevices.util.Platform
@@ -46,9 +47,10 @@ import coredevices.util.models.CactusSTTMode
 import coredevices.util.queue.TaskStatus
 import coredevices.util.transcription.CactusModelPathProvider
 import coredevices.util.transcription.CactusTranscriptionService
+import coredevices.util.transcription.HybridTranscriptionService
+import coredevices.util.transcription.KirinkiTranscriptionService
 import coredevices.util.transcription.NoOpInferenceBoost
 import coredevices.util.transcription.TranscriptionService
-import coredevices.util.transcription.WisprFlowTranscriptionService
 import coredevices.util.CoreConfig
 import coredevices.util.CoreConfigFlow
 import coredevices.util.STTConfig
@@ -56,6 +58,10 @@ import coredevices.api.WisprFlowAuth
 import coredevices.mcp.data.SemanticResult
 import coredevices.ring.model.CactusModelProvider
 import com.russhwolf.settings.SharedPreferencesSettings
+import coredevices.firestore.PebbleUser
+import coredevices.libindex.database.repository.RingTransferRepository
+import coredevices.ring.agent.builtin_servlets.messaging.ApprovedBeeperContact
+import coredevices.util.transcription.WisprFlowRESTTranscriptionService
 import dev.gitlive.firebase.Firebase
 import dev.gitlive.firebase.auth.auth
 import kotlinx.coroutines.CompletableJob
@@ -88,9 +94,12 @@ import kotlinx.datetime.LocalTime
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 import kotlin.time.toJavaDuration
 import io.ktor.client.engine.HttpClientEngine
 import io.ktor.client.engine.okhttp.OkHttp
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 
 // ---- Transcription Normalization ----
 
@@ -543,7 +552,8 @@ class RingRecordingE2ETest {
         // Real API clients
         singleOf(::NenyaClientImpl) bind NenyaClient::class
         singleOf(::WisprFlowAuth)
-        singleOf(::WisprFlowTranscriptionService)
+        singleOf(::WisprFlowRESTTranscriptionService)
+        singleOf(::KirinkiTranscriptionService)
 
         // Cactus local transcription
         single { CactusModelProvider() }
@@ -557,8 +567,21 @@ class RingRecordingE2ETest {
                 ))
             ))
         }
+        single<coredevices.analytics.CoreAnalytics> {
+            object : coredevices.analytics.CoreAnalytics {
+                override fun logEvent(name: String, parameters: Map<String, Any>?) {}
+                override suspend fun logHeartbeatState(name: String, value: Boolean, timestamp: kotlin.time.Instant) {}
+                override suspend fun processHeartbeat() {}
+                override fun updateLastConnectedSerial(serial: String?) {}
+                override fun updateRingTransferDurationMetric(duration: kotlin.time.Duration) {}
+                override fun updateRingLifetimeCollectionCount(serial: String, count: Int) {}
+            }
+        }
         single {
-            CactusTranscriptionService(get(), get(), get<CactusModelPathProvider>(), NoOpInferenceBoost())
+            CactusTranscriptionService(get(), get<CactusModelPathProvider>(), get(), NoOpInferenceBoost())
+        }
+        single {
+            HybridTranscriptionService(get(), get(), get(), get(), get())
         } bind TranscriptionService::class
 
         // MCP tools
@@ -571,9 +594,16 @@ class RingRecordingE2ETest {
         single<coredevices.firestore.UsersDao> {
             object : coredevices.firestore.UsersDao {
                 override val user = kotlinx.coroutines.flow.flowOf<coredevices.firestore.PebbleUser?>(null)
+                override val loginEvents: Flow<PebbleUser> = emptyFlow()
+
                 override suspend fun updateTodoBlockId(todoBlockId: String) {}
                 override suspend fun initUserDevToken(rebbleUserToken: String?) {}
                 override suspend fun updateLastConnectedWatch(serial: String) {}
+                override suspend fun updateRingLifetimeCollectionCount(
+                    serial: String,
+                    count: Int
+                ) {}
+
                 override fun init() {}
             }
         }
@@ -591,13 +621,14 @@ class RingRecordingE2ETest {
         singleOf(::DocumentEncryptor)
 
         // Processing pipeline
-        singleOf(::RecordingStorage)
+        singleOf(::RealRecordingStorage) bind RecordingStorage::class
         singleOf(::RecordingPreprocessor)
         singleOf(::RecordingProcessor)
         singleOf(::RingTraceSession)
 
         // Agent
-        factory { p -> AgentNenya(get(), p.getOrNull() ?: emptyList(), p.getOrNull() ?: false) }
+        factory { p -> IndexAgentNenya(get(), p.getOrNull() ?: emptyList()) }
+        factory { p -> SearchAgentNenya(get(), get(), get(), p.getOrNull() ?: emptyList()) }
         singleOf(::AgentFactory)
         singleOf(::RecordingOperationFactory)
 
@@ -618,7 +649,7 @@ class RingRecordingE2ETest {
         // Webhook (disabled)
         single {
             object : IndexWebhookApi {
-                override fun uploadIfEnabled(samples: ShortArray?, sampleRate: Int, recordingId: String, transcription: String?) {}
+                override fun uploadIfEnabled(samples: ShortArray?, sampleRate: Int, recordingId: String, transcription: String?, recordedAt: Instant) {}
                 override val isEnabled: StateFlow<Boolean> = MutableStateFlow(false)
             }
         } bind IndexWebhookApi::class
@@ -643,15 +674,17 @@ private class E2EPreferences : Preferences {
     override val musicControlMode: StateFlow<MusicControlMode> = MutableStateFlow(MusicControlMode.Disabled)
     override val lastSyncIndex: StateFlow<Int?> = MutableStateFlow(null)
     override val debugDetailsEnabled: StateFlow<Boolean> = MutableStateFlow(false)
-    override val approvedBeeperContacts: StateFlow<List<String>> = MutableStateFlow(emptyList())
+    override val approvedBeeperContacts: StateFlow<List<ApprovedBeeperContact>> = MutableStateFlow(emptyList())
     override val secondaryMode: StateFlow<SecondaryMode> = MutableStateFlow(SecondaryMode.Disabled)
-    override val reminderProvider: StateFlow<ReminderProvider> = MutableStateFlow(ReminderProvider.Native)
+    override val secondaryModeMcpGroupId: StateFlow<Long?> = MutableStateFlow(null)
+    override val reminderProvider: StateFlow<ReminderProvider> = MutableStateFlow(ReminderProvider.BuiltIn)
     override val noteProvider: StateFlow<NoteProvider> = MutableStateFlow(NoteProvider.Builtin)
     override val noteShortcut: StateFlow<NoteShortcutType> = MutableStateFlow(NoteShortcutType.SendToMe)
     override val backupEnabled: StateFlow<Boolean> = MutableStateFlow(false)
     override val useEncryption: StateFlow<Boolean> = MutableStateFlow(false)
     override val encryptionKeyFingerprint: StateFlow<String?> = MutableStateFlow(null)
     override val lastWipedRing: StateFlow<String?> = MutableStateFlow(null)
+    override val lastBackupCount: StateFlow<Int?> = MutableStateFlow(null)
 
     override suspend fun setUseCactusAgent(useCactus: Boolean) {}
     override suspend fun setUseCactusTranscription(useCactus: Boolean) {}
@@ -661,8 +694,9 @@ private class E2EPreferences : Preferences {
     override fun setMusicControlMode(mode: MusicControlMode) {}
     override suspend fun setLastSyncIndex(index: Int?) {}
     override fun setDebugDetailsEnabled(enabled: Boolean) {}
-    override suspend fun setApprovedBeeperContacts(contacts: List<String>?) {}
+    override suspend fun setApprovedBeeperContacts(contacts: List<ApprovedBeeperContact>?) {}
     override fun setSecondaryMode(mode: SecondaryMode) {}
+    override fun setSecondaryModeMcpGroupId(groupId: Long?) {}
     override fun setReminderProvider(provider: ReminderProvider) {}
     override fun setNoteProvider(provider: NoteProvider) {}
     override fun setNoteShortcut(shortcut: NoteShortcutType) {}
@@ -670,4 +704,5 @@ private class E2EPreferences : Preferences {
     override fun setUseEncryption(enabled: Boolean) {}
     override fun setEncryptionKeyFingerprint(fingerprint: String?) {}
     override fun setLastWipedRing(id: String?) {}
+    override fun setLastBackupCount(count: Int?) {}
 }

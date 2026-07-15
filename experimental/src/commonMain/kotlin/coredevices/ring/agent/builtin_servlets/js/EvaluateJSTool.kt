@@ -3,23 +3,18 @@ package coredevices.ring.agent.builtin_servlets.js
 import co.touchlab.kermit.Logger
 import coredevices.indexai.util.JsonSnake
 import coredevices.mcp.BuiltInMcpTool
+import coredevices.mcp.SessionContext
 import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
-import coredevices.ring.agent.currentSessionContext
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.toJson
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonObject
-import coredevices.ring.database.room.repository.ItemRepository
-import coredevices.ring.service.indexfeed.ItemFactory
-import coredevices.ring.service.indexfeed.RecordingSessionContext
 import coredevices.util.CoreConfigFlow
-import kotlinx.coroutines.currentCoroutineContext
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.get
-import org.koin.core.component.inject
 
 class EvaluateJSTool : BuiltInMcpTool(
     definition = Tool(
@@ -54,8 +49,6 @@ class EvaluateJSTool : BuiltInMcpTool(
     ),
     extraContext = CONTEXT,
 ), KoinComponent {
-    private val itemRepo: ItemRepository by inject()
-    private val itemFactory: ItemFactory by inject()
 
     companion object {
         private val logger = Logger.withTag(EvaluateJSTool::class.simpleName!!)
@@ -90,7 +83,7 @@ class EvaluateJSTool : BuiltInMcpTool(
         val consoleOutput: String
     )
 
-    override suspend fun call(jsonInput: String): ToolCallResult {
+    override suspend fun call(jsonInput: String, context: SessionContext): ToolCallResult {
         val evaluateJSArgs = JsonSnake.decodeFromString<EvaluateJSArgs>(jsonInput)
         val obfuscate = get<CoreConfigFlow>().value.obfuscateSensitiveLogs
         logger.v { "Evaluating JavaScript: ${if (obfuscate) "[${evaluateJSArgs.js.length} chars redacted]" else evaluateJSArgs.js}" }
@@ -98,24 +91,14 @@ class EvaluateJSTool : BuiltInMcpTool(
         val consoleOutput = jsEngine.evaluate(evaluateJSArgs.js)
         val result = JsonSnake.encodeToString(EvaluateJSResult(consoleOutput))
         logger.v { "JavaScript evaluation result: ${if (obfuscate) "[redacted]" else result}" }
-        currentSessionContext()?.let { ctx ->
-            runCatching {
-                itemRepo.setItem(
-                    itemFactory.simpleUid(),
-                    itemFactory.actionLogItem(
-                        sourceRecordingId = ctx.sourceRecordingId,
-                        createdAt = ctx.createdAt,
-                        title = "Ran JavaScript",
-                        toolName = TOOL_NAME,
-                        success = true,
-                        body = evaluateJSArgs.js.take(240),
-                    )
-                )
-            }
-        }
         return ToolCallResult(
             result,
-            semanticResult = SemanticResult.SupportingData("JavaScript evaluation result")
+            semanticResult = SemanticResult.ActionLogged(
+                toolName = TOOL_NAME,
+                title = "Ran JavaScript",
+                success = true,
+                body = evaluateJSArgs.js.take(240),
+            )
         )
     }
 }

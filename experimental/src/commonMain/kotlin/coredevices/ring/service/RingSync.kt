@@ -3,6 +3,7 @@ package coredevices.ring.service
 import co.touchlab.kermit.Logger
 import coredevices.analytics.CoreAnalytics
 import coredevices.firestore.UsersDao
+import coredevices.haversine.BluetoothFailureReason
 import coredevices.haversine.DataDecodeException
 import coredevices.haversine.KMPHaversineSatellite
 import coredevices.haversine.KMPHaversineSatelliteManager
@@ -14,6 +15,7 @@ import coredevices.libindex.database.entity.RingTransferStatus
 import coredevices.ring.data.entity.room.TraceEventData
 import coredevices.ring.database.Preferences
 import coredevices.libindex.database.repository.RingTransferRepository
+import coredevices.libindex.device.DiscoveredIndexDevice
 import coredevices.libindex.device.IndexDeviceManager
 import coredevices.ring.service.recordings.RecordingProcessingQueue
 import coredevices.ring.storage.RecordingStorage
@@ -22,21 +24,29 @@ import coredevices.util.Platform
 import coredevices.util.isIOS
 import coredevices.util.transcription.TranscriptionService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -52,6 +62,7 @@ import kotlin.math.roundToInt
 import kotlin.time.Clock
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 import kotlin.time.TimeSource
 import kotlin.time.measureTime
 import kotlin.uuid.Uuid
@@ -106,6 +117,10 @@ sealed interface RingEvent {
             override val isFailsafe: Boolean
         ) : FirmwareUpdate
     }
+
+    data class BluetoothPeerPairingIssue(
+        override val ringId: String,
+    ) : RingEvent
 }
 
 class RingSync(
@@ -133,8 +148,12 @@ class RingSync(
         }
     }
     private var syncJob: Job? = null
+    private val saveSemaphore = Semaphore(permits = 8)
     private val _lastRing: MutableStateFlow<KMPHaversineSatellite?> = MutableStateFlow(null)
     val lastRing = _lastRing.asStateFlow()
+
+    private val _lastSyncedAt: MutableStateFlow<Instant?> = MutableStateFlow(null)
+    val lastSyncedAt = _lastSyncedAt.asStateFlow()
 
     private fun resample(samples: ShortArray, sampleRate: Int): ShortArray {
         val resampler = Resampler(sampleRate, TARGET_SAMPLE_RATE)
@@ -148,8 +167,6 @@ class RingSync(
 
     private val _ringEvents = MutableSharedFlow<RingEvent>(replay = 1, extraBufferCapacity = 50, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     val ringEvents = _ringEvents.asSharedFlow()
-    private val _lifetimeTransferCount = MutableStateFlow(null)
-    val lifetimeTransferCount = _lifetimeTransferCount.asStateFlow()
 
     private fun logTransferEvent(
         latency: Long?,
@@ -176,6 +193,29 @@ class RingSync(
         )
     }
 
+    private fun logTransferFailedEvent(
+        serialNumber: String?,
+        rssi: Int?,
+        transferStartIndex: Int?,
+        reason: String?,
+        recoverable: Boolean,
+    ) {
+        coreAnalytics.logEvent(
+            "ring.transfer_failed",
+            buildMap {
+                put("ring_serial", serialNumber ?: "<none>")
+                rssi?.let {
+                    put("rssi", rssi)
+                }
+                transferStartIndex?.let {
+                    put("transfer_start_index", it)
+                }
+                put("failure_reason", reason ?: "<unknown>")
+                put("recoverable", recoverable)
+            }
+        )
+    }
+
     private fun saveBadCollectionData(data: ByteArray): String {
         val filename = "bad_collection_${Clock.System.now()}.bin"
         scope.launch(Dispatchers.IO) {
@@ -186,6 +226,7 @@ class RingSync(
         return filename
     }
 
+    @OptIn(FlowPreview::class)
     fun startSyncJob(satelliteManager: KMPHaversineSatelliteManager) {
         logger.d { "startSyncJob()" }
         syncJob?.cancel()
@@ -196,20 +237,42 @@ class RingSync(
         }
 
         syncJob = scope.launch {
+            val lifetimeCollectionCount = MutableSharedFlow<Pair<String, Int>>(extraBufferCapacity = 1, onBufferOverflow = BufferOverflow.DROP_OLDEST)
             launch {
                 buttonActionHandler.handleButtonActions()
             }
             launch {
                 indexNotificationManager.processRingSyncTransferNotifications(ringEvents)
             }
+            launch(Dispatchers.IO) {
+                lifetimeCollectionCount.debounce(1.seconds).collect {
+                    val (serial, count) = it
+                    logger.d { "Updating lifetime collection count for $serial to $count" }
+                    coreAnalytics.updateRingLifetimeCollectionCount(serial, count)
+                    usersDao.updateRingLifetimeCollectionCount(serial, count)
+                }
+            }
             satelliteManager.lastRing.onEach {
                 _lastRing.value = it
             }.launchIn(this)
-            prefs.ringPaired.collectLatest { paired ->
-                if (paired != null) {
+            // Run the satellite scan/sync loop when a ring is paired, or when an unpaired
+            // ring is discovered in failsafe mode so it can be recovered via the scan.
+            combine(prefs.ringPaired, deviceManager.rings) { paired, rings ->
+                val isPaired = paired != null
+                val isFailsafe = rings.any { it is DiscoveredIndexDevice && it.isFailsafe }
+                isPaired to isFailsafe
+            }.distinctUntilChanged().map { (isPaired, isFailsafe) ->
+                if (isPaired) {
+                    logger.d { "Ring is paired, enabling sync job" }
+                } else if (isFailsafe) {
+                    logger.d { "Failsafe ring discovered, enabling sync job to allow recovery" }
+                }
+                isPaired || isFailsafe
+            }.collectLatest { syncEnabled ->
+                if (syncEnabled) {
                     var lastIdx: Int = -1
                     var transferRange: IntRange? = null
-                    logger.d { "Paired is true, starting scan/sync job" }
+                    logger.d { "Ring paired or failsafe ring discovered, starting scan/sync job" }
                     while (isActive) {
                         try {
                             logger.d { "Waiting for Bluetooth to become available..." }
@@ -228,7 +291,7 @@ class RingSync(
                                             logger.d { "Status ${satelliteStatus.transferStatus} $t lastRSSI = ${satelliteStatus.satellite.lastAdvertisement?.rssi} lastRxRSSI = ${satelliteStatus.satellite.state.value?.rxRSSI}" }
                                             val transferStatus = satelliteStatus.transferStatus
                                             if (transferStatus is TransferStatus.TransferComplete) {
-                                                withContext(Dispatchers.IO) {
+                                                withContext(Dispatchers.Default) {
                                                     removeDCBias(transferStatus.samples)
                                                 }
                                             }
@@ -290,8 +353,7 @@ class RingSync(
                                                                     ?: transferStatus.satellite.state.value?.serialNumber
                                                         )?.let { serial ->
                                                             transferStatus.lifetimeCollectionCount?.let { count ->
-                                                                coreAnalytics.updateRingLifetimeCollectionCount(serial, count.toInt())
-                                                                usersDao.updateRingLifetimeCollectionCount(serial, count.toInt())
+                                                                lifetimeCollectionCount.emit(serial to count.toInt())
                                                             } ?: logger.w {
                                                                 "No lifetime collection count available to update for serial $serial"
                                                             }
@@ -337,6 +399,25 @@ class RingSync(
                                                                     }
                                                                 }
 
+                                                                // Advancing to a new start index means any lower index still in
+                                                                // Started never had its audio delivered (the ring moved on). Fail
+                                                                // them so they reach a terminal state (MOB-8727).
+                                                                val orphaned = withContext(Dispatchers.IO) {
+                                                                    ringTransferRepository.failOrphanedStartedTransfersBelow(idx)
+                                                                }
+                                                                orphaned.forEach { orphan ->
+                                                                    trace.markEvent("past_transfer_failed",
+                                                                        TraceEventData.PastTransferFailed(
+                                                                            satellite = satelliteSerial,
+                                                                            transferId = orphan.id
+                                                                        )
+                                                                    )
+                                                                    logger.i {
+                                                                        "Advanced to index $idx, marking orphaned transfer ${orphan.id} " +
+                                                                                "(start idx ${orphan.transferInfo?.collectionStartIndex}) as failed"
+                                                                    }
+                                                                }
+
                                                                 lastIdx = idx
                                                                 val id = withContext(Dispatchers.IO) {
                                                                     ringTransferRepository.createRingTransfer(
@@ -353,6 +434,10 @@ class RingSync(
                                                     }
 
                                                     is TransferStatus.TransferFailed -> {
+                                                        // A range can drop many indices, each emitting TransferFailed.
+                                                        // transferRange is non-null only for the first drop in the range
+                                                        // (we clear it below), so log a single failed event per range.
+                                                        val rangeStart = transferRange?.first
                                                         transferRange = null
                                                         trace.markEvent("transfer_dropped_recoverable",
                                                             TraceEventData.TransferDroppedRecoverable(
@@ -361,6 +446,15 @@ class RingSync(
                                                             )
                                                         )
                                                         logger.e(transferStatus.exception) { "Transfer dropped: ${transferStatus.collectionIndex}" }
+                                                        if (rangeStart != null) {
+                                                            logTransferFailedEvent(
+                                                                serialNumber = satelliteSerial,
+                                                                rssi = transferStatus.satellite.lastAdvertisement?.rssi?.roundToInt(),
+                                                                transferStartIndex = rangeStart,
+                                                                reason = transferStatus.exception?.message,
+                                                                recoverable = true,
+                                                            )
+                                                        }
                                                     }
 
                                                     is TransferStatus.IrrecoverableDataDetected -> {
@@ -406,6 +500,13 @@ class RingSync(
                                                                 collectionIndex = transferStatus.collection?.startIndex
                                                             )
                                                         )
+                                                        logTransferFailedEvent(
+                                                            serialNumber = satelliteSerial,
+                                                            rssi = transferStatus.satellite.lastAdvertisement?.rssi?.roundToInt(),
+                                                            transferStartIndex = transferStatus.collection?.startIndex,
+                                                            reason = transferStatus.exception?.message,
+                                                            recoverable = false,
+                                                        )
                                                         sendBugReportPrompt()
                                                     }
 
@@ -445,6 +546,7 @@ class RingSync(
                                                     }
 
                                                     is TransferStatus.TransferComplete -> {
+                                                        _lastSyncedAt.value = Clock.System.now()
                                                         val range = transferRange
                                                         trace.markEvent("transfer_completed",
                                                             TraceEventData.TransferCompleted(
@@ -532,64 +634,93 @@ class RingSync(
                                                                     }
                                                                 },
                                                         )
-                                                        withContext(Dispatchers.IO) {
-                                                            ringTransferRepository.updateTransferInfo(
-                                                                transfer.id,
-                                                                transferInfo
-                                                            )
-                                                        }
-                                                        logger.d { "Saving transfer..." }
-                                                        id = "ring_${transferStatus.satellite.id}-${transferStatus.collectionIndex}-${Uuid.random()}"
-                                                        if (audioDuration >= 1.5) {
-                                                            trace.markEvent("saving_recording_start")
-                                                            val samplesResampled = withContext(Dispatchers.Default) {
-                                                                val t = TimeSource.Monotonic.markNow()
-                                                                val samples = resample(
-                                                                    transferStatus.samples,
-                                                                    transferStatus.sampleRate.toInt()
-                                                                )
-                                                                val dur = t.elapsedNow()
-                                                                logger.d { "Resampling took ${dur.inWholeMilliseconds} ms" }
-                                                                samples
-                                                            }
-                                                            val nwSampleRate = TARGET_SAMPLE_RATE
-                                                            listOf(
-                                                                async(Dispatchers.IO) {
-                                                                    val t = TimeSource.Monotonic.measureTime {
-                                                                        recordingStorage.openRecordingSink(
-                                                                            id,
-                                                                            nwSampleRate,
-                                                                            "audio/raw"
-                                                                        ).use { sink ->
-                                                                            sink.write(samplesResampled.toByteArrayLe())
-                                                                        }
-                                                                    }
-                                                                    logger.d { "Saved recording in ${t.inWholeMilliseconds} ms" }
-                                                                },
-                                                                async(Dispatchers.IO) {
-                                                                    val t = TimeSource.Monotonic.measureTime {
-                                                                        recordingStorage.openCleanRecordingSink(
-                                                                            id,
-                                                                            transferStatus.sampleRate.toInt(),
-                                                                            "audio/raw"
-                                                                        ).use { sink ->
-                                                                            sink.write(transferStatus.samples.toByteArrayLe())
-                                                                        }
-                                                                    }
-                                                                    logger.d { "Saved clean recording in ${t.inWholeMilliseconds} ms" }
-                                                                }
-                                                            ).awaitAll()
-                                                            trace.markEvent("saving_recording_end")
-
+                                                        if (audioDuration >= 1.0) {
                                                             withContext(Dispatchers.IO) {
-                                                                ringTransferRepository.markTransferCompleteAndSetFileId(
+                                                                ringTransferRepository.updateTransferInfo(
                                                                     transfer.id,
-                                                                    id
+                                                                    transferInfo
                                                                 )
-                                                                recordingProcessingQueue.queueAudioProcessing(
+                                                                ringTransferRepository.updateTransferStatus(
                                                                     transfer.id,
-                                                                    transferStatus.buttonSequence,
+                                                                    RingTransferStatus.Saving
                                                                 )
+                                                            }
+                                                            logger.d { "Saving transfer..." }
+                                                            id = "ring_${transferStatus.satellite.id}-${transferStatus.collectionIndex}-${Uuid.random()}"
+                                                            launch {
+                                                                saveSemaphore.withPermit {
+                                                                    try {
+                                                                        trace.markEvent(
+                                                                            "saving_recording_start",
+                                                                            TraceEventData.SavingRecordingStart(transfer.id)
+                                                                        )
+                                                                        val samplesResampled = withContext(Dispatchers.Default) {
+                                                                            val t = TimeSource.Monotonic.markNow()
+                                                                            val samples = resample(
+                                                                                transferStatus.samples,
+                                                                                transferStatus.sampleRate.toInt()
+                                                                            )
+                                                                            val dur = t.elapsedNow()
+                                                                            logger.d { "Resampling took ${dur.inWholeMilliseconds} ms" }
+                                                                            samples
+                                                                        }
+                                                                        val nwSampleRate = TARGET_SAMPLE_RATE
+                                                                        listOf(
+                                                                            async(Dispatchers.IO) {
+                                                                                val t = TimeSource.Monotonic.measureTime {
+                                                                                    recordingStorage.openRecordingSink(
+                                                                                        id,
+                                                                                        nwSampleRate,
+                                                                                        "audio/raw"
+                                                                                    ).use { sink ->
+                                                                                        sink.write(samplesResampled.toByteArrayLe())
+                                                                                    }
+                                                                                }
+                                                                                logger.d { "Saved recording in ${t.inWholeMilliseconds} ms" }
+                                                                            },
+                                                                            async(Dispatchers.IO) {
+                                                                                val t = TimeSource.Monotonic.measureTime {
+                                                                                    recordingStorage.openOriginalRecordingSink(
+                                                                                        id,
+                                                                                        nwSampleRate,
+                                                                                        "audio/raw"
+                                                                                    ).use { sink ->
+                                                                                        sink.write(samplesResampled.toByteArrayLe())
+                                                                                    }
+                                                                                }
+                                                                                logger.d { "Saved original recording in ${t.inWholeMilliseconds} ms" }
+                                                                            }
+                                                                        ).awaitAll()
+                                                                        trace.markEvent(
+                                                                            "saving_recording_end",
+                                                                            TraceEventData.SavingRecordingEnd(transfer.id)
+                                                                        )
+
+                                                                        withContext(Dispatchers.IO) {
+                                                                            ringTransferRepository.markTransferCompleteAndSetFileId(
+                                                                                transfer.id,
+                                                                                id
+                                                                            )
+                                                                            recordingProcessingQueue.queueAudioProcessing(
+                                                                                transfer.id,
+                                                                                transferStatus.buttonSequence,
+                                                                            )
+                                                                        }
+                                                                    } catch (e: CancellationException) {
+                                                                        throw e
+                                                                    } catch (e: Exception) {
+                                                                        logger.e(e) { "Error saving/queueing transfer ${transfer.id}: ${e.message}" }
+                                                                        // Saving is excluded from the orphan sweep, so give a failed
+                                                                        // save an explicit terminal state instead of stranding it.
+                                                                        withContext(NonCancellable + Dispatchers.IO) {
+                                                                            ringTransferRepository.updateTransferStatus(
+                                                                                transfer.id,
+                                                                                RingTransferStatus.Failed
+                                                                            )
+                                                                        }
+                                                                        sendBugReportPrompt()
+                                                                    }
+                                                                }
                                                             }
                                                         } else {
                                                             logger.i { "Discarding transfer due to short duration: $audioDuration seconds" }
@@ -677,6 +808,19 @@ class RingSync(
                                                 "Satellite ${satelliteStatus.satellite.id} programming user ID"
                                             }
                                         }
+
+                                        is SatelliteStatus.BluetoothFailure -> {
+                                            logger.e {
+                                                "Satellite ${satelliteStatus.satellite.id} Bluetooth failure: ${satelliteStatus.reason}"
+                                            }
+                                            if (satelliteStatus.reason == BluetoothFailureReason.PeerRemovedPairingInformation) {
+                                                _ringEvents.emit(
+                                                    RingEvent.BluetoothPeerPairingIssue(
+                                                        ringId = satelliteStatus.satellite.id,
+                                                    )
+                                                )
+                                            }
+                                        }
                                     }
                                     //logger.d { "Handled satellite status ${satelliteStatus::class.simpleName} in $dur" }
                                 }
@@ -689,13 +833,13 @@ class RingSync(
                         }
                     }
                 } else {
-                    logger.d { "Paired is false" }
+                    logger.d { "No paired or failsafe ring, sync loop disabled" }
                 }
             }
         }
     }
 
-    fun sendBugReportPrompt() {
+    suspend fun sendBugReportPrompt() {
         indexNotificationManager.sendBugReportPrompt(
             "Index ran into a problem",
             """

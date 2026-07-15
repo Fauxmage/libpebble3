@@ -12,7 +12,8 @@ import coredevices.indexai.database.dao.ConversationMessageDao
 import coredevices.indexai.database.dao.RecordingEntryDao
 import coredevices.mcp.client.McpIntegration
 import coredevices.ring.agent.AgentFactory
-import coredevices.ring.agent.AgentNenya
+import coredevices.ring.agent.IndexAgentNenya
+import coredevices.ring.agent.SearchAgentNenya
 import coredevices.ring.agent.BuiltinServletRepository
 import coredevices.ring.agent.McpSessionFactory
 import coredevices.ring.agent.builtin_servlets.notes.NoteProvider
@@ -42,6 +43,7 @@ import coredevices.ring.service.recordings.RecordingProcessor
 import coredevices.ring.service.recordings.button.RecordingOperationFactory
 import coredevices.ring.encryption.DocumentEncryptor
 import coredevices.ring.encryption.EncryptionKeyManager
+import coredevices.ring.storage.RealRecordingStorage
 import coredevices.ring.storage.RecordingStorage
 import coredevices.ring.util.trace.RingTraceSession
 import coredevices.util.models.CactusSTTMode
@@ -71,8 +73,10 @@ import org.koin.core.module.dsl.singleOf
 import org.koin.dsl.bind
 import org.koin.dsl.module
 import java.io.File
+import kotlin.collections.emptyList
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.Instant
 
 // region Fakes
 
@@ -88,13 +92,15 @@ class FakePreferences : Preferences {
     override val debugDetailsEnabled: StateFlow<Boolean> = MutableStateFlow(false)
     override val approvedBeeperContacts: StateFlow<List<ApprovedBeeperContact>> = MutableStateFlow(emptyList())
     override val secondaryMode: StateFlow<SecondaryMode> = MutableStateFlow(SecondaryMode.Disabled)
-    override val reminderProvider: StateFlow<ReminderProvider> = MutableStateFlow(ReminderProvider.Native)
+    override val secondaryModeMcpGroupId: StateFlow<Long?> = MutableStateFlow(null)
+    override val reminderProvider: StateFlow<ReminderProvider> = MutableStateFlow(ReminderProvider.BuiltIn)
     override val noteProvider: StateFlow<NoteProvider> = MutableStateFlow(NoteProvider.Builtin)
     override val noteShortcut: StateFlow<NoteShortcutType> = MutableStateFlow(NoteShortcutType.SendToMe)
     override val backupEnabled: StateFlow<Boolean> = MutableStateFlow(false)
     override val useEncryption: StateFlow<Boolean> = MutableStateFlow(false)
     override val encryptionKeyFingerprint: StateFlow<String?> = MutableStateFlow(null)
     override val lastWipedRing: StateFlow<String?> = MutableStateFlow(null)
+    override val lastBackupCount: StateFlow<Int?> = MutableStateFlow(null)
 
     override suspend fun setUseCactusAgent(useCactus: Boolean) {}
     override suspend fun setUseCactusTranscription(useCactus: Boolean) {}
@@ -106,6 +112,7 @@ class FakePreferences : Preferences {
     override fun setDebugDetailsEnabled(enabled: Boolean) {}
     override suspend fun setApprovedBeeperContacts(contacts: List<ApprovedBeeperContact>?) {}
     override fun setSecondaryMode(mode: SecondaryMode) {}
+    override fun setSecondaryModeMcpGroupId(groupId: Long?) {}
     override fun setReminderProvider(provider: ReminderProvider) {}
     override fun setNoteProvider(provider: NoteProvider) {}
     override fun setNoteShortcut(shortcut: NoteShortcutType) {}
@@ -113,6 +120,9 @@ class FakePreferences : Preferences {
     override fun setUseEncryption(enabled: Boolean) {}
     override fun setEncryptionKeyFingerprint(fingerprint: String?) {}
     override fun setLastWipedRing(id: String?) {}
+    override fun setLastBackupCount(count: Int?) {
+        TODO("Not yet implemented")
+    }
 }
 
 class FakeServletRepository : ServletRepository {
@@ -201,7 +211,7 @@ class RecordingProcessingQueueTest {
         singleOf(::McpSandboxRepository)
         single { EncryptionKeyManager(context.applicationContext) }
         singleOf(::DocumentEncryptor)
-        singleOf(::RecordingStorage)
+        singleOf(::RealRecordingStorage) bind RecordingStorage::class
         singleOf(::RingTraceSession)
 
         // Fakes
@@ -224,13 +234,14 @@ class RecordingProcessingQueueTest {
         single { BuiltinServletRepository() }
 
         // Agent (uses FakeNenyaClient via Koin)
-        factory { p -> AgentNenya(get(), p.getOrNull() ?: emptyList(), p.getOrNull() ?: false) }
+        factory { p -> IndexAgentNenya(get(), p.getOrNull() ?: emptyList()) }
+        factory { p -> SearchAgentNenya(get(), get(), get(), p.getOrNull() ?: emptyList()) }
         singleOf(::AgentFactory)
         singleOf(::McpSessionFactory)
 
         single {
             object : IndexWebhookApi {
-                override fun uploadIfEnabled(samples: ShortArray?, sampleRate: Int, recordingId: String, transcription: String?) {}
+                override fun uploadIfEnabled(samples: ShortArray?, sampleRate: Int, recordingId: String, transcription: String?, recordedAt: Instant) {}
                 override val isEnabled: StateFlow<Boolean> = MutableStateFlow(false)
             }
         } bind IndexWebhookApi::class
@@ -396,6 +407,37 @@ class RecordingProcessingQueueTest {
         assertEquals(1, entries.size)
         assertEquals(RecordingEntryStatus.completed, entries[0].status)
         assertEquals("Retried transcription", entries[0].transcription)
+    }
+
+    @Test
+    fun localAudioProcessing_transcriptionBusy_deferredThenSucceeds() = runBlocking {
+        val fileId = "test-audio-txn-busy"
+        createFakeAudioFile(fileId)
+
+        // First attempt: model busy (TranscriptionInProgress) → RecoverableTaskException → retry,
+        // and the entry must NOT be marked transcription_error. Second attempt: succeeds.
+        fakeTranscription.enqueue(
+            FakeTranscriptionService.Behavior.Busy,
+            FakeTranscriptionService.Behavior.Success("Recovered after busy")
+        )
+        fakeNenya.enqueue(
+            FakeNenyaClient.NenyaResponse.SuccessWithToolCalls,
+            FakeNenyaClient.NenyaResponse.SuccessFinal
+        )
+
+        queue.queueLocalAudioProcessing(fileId)
+        awaitTaskDone(taskId = 1)
+
+        val task = taskDao.getTaskById(1)!!
+        assertEquals(TaskStatus.Success, task.status)
+        assertTrue("Expected at least 2 attempts (busy then success)", task.attempts >= 2)
+
+        // Busy is a transient deferral, not a transcription failure: the final entry is completed
+        // (and was never left in transcription_error, unlike noSpeechDetected which fails terminally).
+        val entries = entryDao.getEntriesForRecording(1).first()
+        assertEquals(1, entries.size)
+        assertEquals(RecordingEntryStatus.completed, entries[0].status)
+        assertEquals("Recovered after busy", entries[0].transcription)
     }
 
     @Test

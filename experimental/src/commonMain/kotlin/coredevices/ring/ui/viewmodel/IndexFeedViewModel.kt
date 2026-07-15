@@ -6,6 +6,9 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import coredevices.indexai.data.entity.LocalRecording
 import coredevices.indexai.data.entity.RecordingEntryEntity
+import coredevices.indexai.data.entity.RecordingEntryStatus
+import coredevices.libindex.database.dao.RingTransferDao
+import coredevices.libindex.di.LibIndexCoroutineScope
 import coredevices.ring.data.entity.room.indexfeed.CachedItem
 import coredevices.ring.data.entity.room.indexfeed.CachedList
 import coredevices.ring.data.entity.room.indexfeed.fields
@@ -14,21 +17,24 @@ import coredevices.ring.database.room.repository.ItemRepository
 import coredevices.ring.database.room.repository.ListRepository
 import coredevices.ring.database.room.repository.RecordingRepository
 import coredevices.ring.service.indexfeed.DefaultListsBootstrap.Companion.LIST_NOTES_SELF_ID
-import coredevices.ring.service.recordings.RecordingProcessingQueue
 import coredevices.ring.service.indexfeed.DefaultListsBootstrap.Companion.LIST_TODOS_ID
 import coredevices.ring.service.indexfeed.DefaultListsBootstrap.Companion.SEED_TODOS
+import coredevices.ring.service.recordings.RecordingProcessingQueue
+import coredevices.ring.ui.viewmodel.IndexFeedViewModel.Companion.STRIKE_THROUGH_MS
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.IO
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
-import kotlinx.serialization.json.contentOrNull
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
 
@@ -44,6 +50,8 @@ class IndexFeedViewModel(
     private val itemRepo: ItemRepository,
     listRepo: ListRepository,
     private val recordingQueue: RecordingProcessingQueue,
+    private val ringTransferDao: RingTransferDao,
+    private val appScope: LibIndexCoroutineScope,
 ) : ViewModel() {
 
     /** What the user typed into the search bar. Empty = not searching. */
@@ -105,6 +113,34 @@ class IndexFeedViewModel(
         }
     }
 
+    /** Re-enqueue a recording whose transcription failed. Mirrors
+     *  [FullFeedViewModel.retryRecording] / RecordingDetailsViewModel — a
+     *  ring transfer retries from the original audio, otherwise we retry the
+     *  locally-stored file. */
+    fun retryRecording(recordingId: Long, entry: RecordingEntryEntity) {
+        viewModelScope.launch {
+            val transfer = withContext(Dispatchers.IO) {
+                ringTransferDao.getByRecordingId(recordingId).firstOrNull()
+            }
+            if (transfer != null) {
+                recordingQueue.retryRecording(
+                    transferId = transfer.id,
+                    buttonSequence = null,
+                    recordingId = recordingId,
+                    recordingEntryId = entry.id,
+                )
+            } else {
+                val fileId = entry.fileName ?: return@launch
+                recordingQueue.retryLocalRecording(
+                    fileId = fileId,
+                    buttonSequence = null,
+                    recordingId = recordingId,
+                    recordingEntryId = entry.id,
+                )
+            }
+        }
+    }
+
     /** Flip an item's `done` flag. When the toggle goes from undone →
      *  done, the id is added to [animatingDoneIds] *before* the DB write
      *  fires — otherwise the flow re-emits with `done=true` and the row
@@ -114,20 +150,21 @@ class IndexFeedViewModel(
         val s = state.value
         val item = (s.todosPreview + s.notesLists.flatMap { it.items } + s.answersPreview)
             .firstOrNull { it.firestoreId == itemId } ?: return
+        if (item.locked) return // can't toggle a row we can't read
         val wasDone = item.done
         if (!wasDone) {
             // Mark animating BEFORE the DB write so the upcoming flow
             // re-emit doesn't cause a flicker (row leaving + re-entering
             // the active bucket).
             animatingDoneJobs.remove(itemId)?.cancel()
-            animatingDoneIds.value = animatingDoneIds.value + itemId
+            animatingDoneIds.value += itemId
         } else {
             // Toggling back to undone — cancel any in-flight strike
             // removal so the row doesn't disappear unexpectedly.
             animatingDoneJobs.remove(itemId)?.cancel()
-            animatingDoneIds.value = animatingDoneIds.value - itemId
+            animatingDoneIds.value -= itemId
         }
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val updated = item.toDocument().copy(
                 done = !item.done,
                 updatedAt = Clock.System.now(),
@@ -136,7 +173,7 @@ class IndexFeedViewModel(
             if (!wasDone) {
                 animatingDoneJobs[itemId] = viewModelScope.launch {
                     delay(STRIKE_THROUGH_MS)
-                    animatingDoneIds.value = animatingDoneIds.value - itemId
+                    animatingDoneIds.value -= itemId
                     animatingDoneJobs.remove(itemId)
                 }
             }
@@ -185,6 +222,10 @@ class IndexFeedViewModel(
              *  "Alarm · 09:00", or "No action taken" when nothing was made. */
             val primaryChip: String,
             val orphan: Boolean,
+            /** Latest entry when its transcription failed and can be retried.
+             *  Non-null → the peek card shows "Transcription error" + a retry
+             *  button instead of the primary action chip. */
+            val retryEntry: RecordingEntryEntity? = null,
         )
 
         companion object {
@@ -225,8 +266,8 @@ class IndexFeedViewModel(
             val itemsByRecording = items
                 .filter { !it.deleted }
                 .groupBy { it.sourceRecordingId.orEmpty() }
-            val transcriptionByRec = entries
-                .groupBy { it.recordingId }
+            val entriesByRec = entries.groupBy { it.recordingId }
+            val transcriptionByRec = entriesByRec
                 .mapValues { (_, es) -> es.firstOrNull()?.transcription.orEmpty() }
             val recordingsView = (if (isSearching) {
                 recordings.filter { match(it.assistantTitle) || match(transcriptionByRec[it.id]) }
@@ -237,11 +278,20 @@ class IndexFeedViewModel(
                     val recItems = itemsByRecording[rec.firestoreId.orEmpty()].orEmpty() +
                         itemsByRecording["local:${rec.id}"].orEmpty()
                     val primary = recItems.firstOrNull()
+                    // Latest entry decides the error state — a recording can
+                    // accrue retries, so only the most recent attempt's status
+                    // is meaningful. Matches FullFeedViewModel.
+                    val latestEntry = entriesByRec[rec.id].orEmpty()
+                        .sortedWith(compareBy<RecordingEntryEntity> { it.timestamp }.thenBy { it.id })
+                        .lastOrNull()
+                    val retryEntry = latestEntry
+                        ?.takeIf { it.status == RecordingEntryStatus.transcription_error }
                     UiState.RecordingPeek(
                         recording = rec,
                         transcription = transcriptionByRec[rec.id].orEmpty(),
                         primaryChip = primary?.let { chipLabel(it, lists) } ?: "No action taken",
                         orphan = primary == null,
+                        retryEntry = retryEntry,
                     )
                 }
 
@@ -263,16 +313,22 @@ class IndexFeedViewModel(
                     compareBy<CachedItem> { task ->
                         val dueMs = task.dueAt?.toEpochMilliseconds()
                         when {
-                            dueMs != null && dueMs <= urgentCutoffMs -> 0
-                            dueMs == null -> 1
-                            else -> 2
+                            dueMs != null && dueMs > nowMs && dueMs <= urgentCutoffMs -> 0
+                            dueMs != null && dueMs <= nowMs -> 1
+                            dueMs == null -> 2
+                            else -> 3
                         }
                     }
                         .thenBy { task ->
                             val dueMs = task.dueAt?.toEpochMilliseconds()
-                            if (dueMs != null && dueMs <= urgentCutoffMs) dueMs else Long.MAX_VALUE
+                            when {
+                                dueMs != null && dueMs > nowMs && dueMs <= urgentCutoffMs -> dueMs
+                                dueMs != null && dueMs <= nowMs -> -dueMs
+                                dueMs == null -> Long.MAX_VALUE
+                                else -> dueMs
+                            }
                         }
-                        .thenByDescending { it.createdAt.toEpochMilliseconds() }
+                        .thenBy { it.createdAt.toEpochMilliseconds() }
                         .thenBy { it.title.lowercase() },
                 )
                 .toList()
@@ -287,7 +343,16 @@ class IndexFeedViewModel(
             val itemsByList = items
                 .asSequence()
                 .filter { !it.deleted }
-                .filter { it.kind == "note" }
+                // Encrypted-without-key rows have no readable title — keep them
+                // out of the notes grid entirely rather than showing placeholders.
+                .filter { !it.locked }
+                // Notes lists hold both `note` and `checklist` items —
+                // a checklist is just a note with a tickable checkbox,
+                // and the user can convert between the two via the
+                // type dropdown on the item-detail edit hero. Keeping
+                // `note` only here used to silently hide an item from
+                // its parent list the moment it was converted.
+                .filter { it.kind == "note" || it.kind == "checklist" }
                 .sortedByDescending { it.createdAt.toEpochMilliseconds() }
                 .toList()
                 .groupBy { it.parentListIds().firstOrNull() ?: LIST_NOTES_SELF_ID }
@@ -354,6 +419,7 @@ class IndexFeedViewModel(
         /** Pretty-print the primary action chip for a recording's first
          *  extracted item. Mirrors the prototype's `objectChip`. */
         internal fun chipLabel(item: CachedItem, lists: List<CachedList>): String {
+            if (item.locked) return "🔒 Encrypted"
             val fields = item.fields()
             fun strField(key: String): String? = (fields[key] as? JsonPrimitive)?.contentOrNull
             return when (item.kind) {
@@ -377,12 +443,17 @@ class IndexFeedViewModel(
                     "Added to $parentName"
                 }
                 "answer" -> "Answered"
+                "calendar_event" -> item.title.ifBlank { "Event" }
                 "message" -> {
                     val raw = strField("recipientName") ?: strField("contact")
                     val name = raw?.let { messageRecipientLabel(it) }
                     if (!name.isNullOrBlank()) "Sent to $name" else "Message sent"
                 }
                 "action_log" -> item.title.ifBlank { "Action" }
+                "delegated" -> {
+                    val integration = strField("integration")
+                    if (!integration.isNullOrBlank()) "Sent to $integration" else "Sent"
+                }
                 else -> item.title.ifBlank { "Saved" }
             }
         }
@@ -397,26 +468,27 @@ class IndexFeedViewModel(
             return raw
         }
 
-        /** Turn an ISO-8601 duration (`PT20M`, `PT1H30M`, `PT45S`) into a
-         *  human label like "20 min", "1 hr 30 min", "45 sec". Falls back to
-         *  the raw string if parsing fails. Used everywhere we surface a
-         *  timer's duration. */
-        fun formatDuration(iso: String?): String? {
-            if (iso.isNullOrBlank()) return null
-            return try {
-                val d = kotlin.time.Duration.parseIsoString(iso)
-                val totalSec = d.inWholeSeconds
-                val h = totalSec / 3600
-                val m = (totalSec % 3600) / 60
-                val s = totalSec % 60
-                buildString {
-                    if (h > 0) append("$h hr ")
-                    if (m > 0) append("$m min ")
-                    if (s > 0 && h == 0L) append("$s sec")
-                }.trim().ifBlank { iso }
+        /** Turn an ISO-8601 duration (`PT20M`, `PT1H30M`, `PT45S`) or a raw
+         *  millisecond value (legacy cached rows) into a human label like
+         *  "20 min", "1 hr 30 min", "45 sec". Falls back to the raw string
+         *  if parsing fails. Used everywhere we surface a timer's duration. */
+        fun formatDuration(raw: String?): String? {
+            if (raw.isNullOrBlank()) return null
+            // Parse ISO-8601 ("PT3M") or fall back to raw milliseconds for older cached rows
+            val d = try {
+                kotlin.time.Duration.parseIsoString(raw)
             } catch (e: Throwable) {
-                iso
+                raw.toLongOrNull()?.milliseconds ?: return raw
             }
+            val totalSec = d.inWholeSeconds
+            val h = totalSec / 3600
+            val m = (totalSec % 3600) / 60
+            val s = totalSec % 60
+            return buildString {
+                if (h > 0) append("$h hr ")
+                if (m > 0) append("$m min ")
+                if (s > 0 && h == 0L) append("$s sec")
+            }.trim().ifBlank { raw }
         }
     }
 }

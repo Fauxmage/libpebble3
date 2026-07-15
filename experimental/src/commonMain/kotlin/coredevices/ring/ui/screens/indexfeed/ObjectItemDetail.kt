@@ -80,6 +80,8 @@ import coredevices.ring.ui.theme.indexTextEntryStyle
 import coredevices.ring.ui.viewmodel.ObjectDetailViewModel
 import coredevices.ring.ui.viewmodel.kindLabel
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.hours
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
 import kotlinx.datetime.TimeZone
@@ -104,6 +106,12 @@ internal fun ItemView(
     var menuOpen by remember { mutableStateOf(false) }
     val title = s.parentList?.title?.takeIf { it.isNotBlank() } ?: kindLabel(it.kind)
 
+    // Early heads-up notification metadata (built-in reminders only carry a
+    // localReminderId, which is what lets us actually cancel the extra alarm).
+    val reminderMeta = it.metadata as? coredevices.indexai.data.entity.ItemDocument.ItemMetadata.Reminder
+    val notifyBeforeMillis = reminderMeta?.notifyBeforeMillis
+    val canRemoveExtraNotification = reminderMeta?.localReminderId != null
+
     // Always-edit, Apple Notes style. No "Save" button — the draft is
     // persisted automatically when the user navigates away (DisposableEffect
     // onDispose) or backgrounds the app (ON_STOP). Drafts are keyed on
@@ -119,6 +127,7 @@ internal fun ItemView(
     var dueAtTouched by remember(it.firestoreId) { mutableStateOf(false) }
     var draftParentListIds by remember(it.firestoreId) { mutableStateOf(it.parentListIds()) }
     var listsTouched by remember(it.firestoreId) { mutableStateOf(false) }
+    var deleting by remember(it.firestoreId) { mutableStateOf(false) }
     val allLists by vm.allLists.collectAsStateWithLifecycle()
 
     // rememberUpdatedState wrappers so the auto-save lambda captured by
@@ -136,8 +145,10 @@ internal fun ItemView(
     val latestListsTouched = androidx.compose.runtime.rememberUpdatedState(listsTouched)
     val latestOriginalTitle = androidx.compose.runtime.rememberUpdatedState(it.title)
     val latestOriginalBody = androidx.compose.runtime.rememberUpdatedState(it.body)
+    val latestDeleting = androidx.compose.runtime.rememberUpdatedState(deleting)
 
-    val flushDraft: () -> Unit = {
+    val flushDraft: () -> Unit = flushDraft@{
+        if (latestDeleting.value) return@flushDraft
         val titleChanged = latestTitle.value.trim() != latestOriginalTitle.value.trim()
         val bodyChanged = latestBody.value != latestOriginalBody.value
         val dirty = titleChanged || bodyChanged || latestKindTouched.value ||
@@ -187,6 +198,13 @@ internal fun ItemView(
                             text = { Text("Delete ${kindLabel(it.kind).lowercase()}", color = colors.error) },
                             onClick = {
                                 menuOpen = false
+                                deleting = true
+                                // Pop back to the existing parent list already on the
+                                // stack. Using replaceWith here pushed a *new* parent
+                                // instance on every delete, stacking up duplicates so
+                                // back would cycle through the same page N times
+                                // (MOB-8492). The parent list filters out deleted = 0,
+                                // so the removed item disappears automatically.
                                 vm.deleteThis { coreNav.goBack() }
                             },
                         )
@@ -204,13 +222,33 @@ internal fun ItemView(
                     body = draftBody,
                     createdAt = draftCreatedAt,
                     dueAt = draftDueAt,
+                    notifyBeforeMillis = notifyBeforeMillis,
+                    canRemoveExtraNotification = canRemoveExtraNotification,
+                    onRemoveExtraNotification = { vm.removeExtraNotification() },
                     allLists = allLists,
                     selectedListIds = draftParentListIds,
                     onKind = { newKind ->
+                        // Only relocate parents when the kind crosses
+                        // the todos-domain boundary. Switching between
+                        // note ↔ checklist (both notes-domain) used to
+                        // forcibly snap the item to LIST_NOTES_SELF_ID,
+                        // wiping the user's actual parent list (e.g.
+                        // "Index Features"). The fix compares the
+                        // CURRENT draft kind, not the original `it.kind`,
+                        // so a multi-step change like
+                        // note → reminder → checklist correctly relocates
+                        // out of Todos and back into a notes-domain list
+                        // on each boundary cross.
+                        val oldKind = draftKind
                         draftKind = newKind
                         kindTouched = true
-                        listsTouched = true
-                        draftParentListIds = defaultParentListsForKind(newKind)
+                        val isTodoDomain: (String) -> Boolean = { k ->
+                            k == "reminder" || k == "scheduled"
+                        }
+                        if (isTodoDomain(oldKind) != isTodoDomain(newKind)) {
+                            listsTouched = true
+                            draftParentListIds = defaultParentListsForKind(newKind)
+                        }
                         if (newKind != "reminder" && newKind != "scheduled") {
                             draftDueAt = null
                             dueAtTouched = true
@@ -408,6 +446,9 @@ private fun ItemHeroEdit(
     body: String,
     createdAt: Instant,
     dueAt: Instant?,
+    notifyBeforeMillis: Long?,
+    canRemoveExtraNotification: Boolean,
+    onRemoveExtraNotification: () -> Unit,
     allLists: List<coredevices.ring.data.entity.room.indexfeed.CachedList>,
     selectedListIds: List<String>,
     onKind: (String) -> Unit,
@@ -463,6 +504,15 @@ private fun ItemHeroEdit(
         Spacer(Modifier.height(10.dp))
         if (showsDue) {
             DueAtRow(label = "Due", dueAt = dueAt, onChange = onDueAt)
+            // Early heads-up notification, only for reminders that scheduled one and
+            // that we can actually cancel (built-in reminders).
+            if (kind == "reminder" && notifyBeforeMillis != null && canRemoveExtraNotification) {
+                Spacer(Modifier.height(10.dp))
+                EarlyNotificationRow(
+                    notifyBeforeMillis = notifyBeforeMillis,
+                    onRemove = onRemoveExtraNotification,
+                )
+            }
         } else {
             TimestampRow(timestamp = createdAt, onChange = onCreatedAt)
         }
@@ -766,6 +816,52 @@ private fun DueAtRow(label: String, dueAt: Instant?, onChange: (Instant?) -> Uni
                 }
             }
         }
+    }
+}
+
+/** Read-only row for a reminder's extra early notification, with a "Remove" action that
+ *  cancels just that heads-up (leaving the main reminder in place). */
+@Composable
+private fun EarlyNotificationRow(notifyBeforeMillis: Long, onRemove: () -> Unit) {
+    val colors = IndexTheme.colors
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .border(1.dp, colors.outlineVariant, RoundedCornerShape(10.dp))
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+    ) {
+        Text("Early alert", color = colors.onSurfaceVariant, fontSize = 12.sp, modifier = Modifier.width(86.dp))
+        Text(
+            "${formatLeadTime(notifyBeforeMillis)} before",
+            color = colors.onSurface,
+            fontSize = 14.sp,
+            modifier = Modifier.weight(1f),
+        )
+        Text(
+            "Remove",
+            color = colors.primary,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier
+                .clickable { onRemove() }
+                .padding(start = 12.dp),
+        )
+    }
+}
+
+/** "2h", "2h 30m", "30m" — the human lead time for an early reminder notification. */
+private fun formatLeadTime(millis: Long): String {
+    val d = millis.milliseconds
+    return when {
+        d.inWholeHours >= 1 -> {
+            val hours = d.inWholeHours
+            val minutes = (d - hours.hours).inWholeMinutes
+            if (minutes > 0) "${hours}h ${minutes}m" else "${hours}h"
+        }
+        d.inWholeMinutes >= 1 -> "${d.inWholeMinutes}m"
+        else -> "${d.inWholeSeconds}s"
     }
 }
 

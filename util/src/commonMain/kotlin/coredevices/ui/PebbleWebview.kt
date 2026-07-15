@@ -9,6 +9,7 @@ expect fun PebbleWebview(
     interceptor: PebbleWebviewUrlInterceptor,
     modifier: Modifier,
     onPageFinishedJavaScript: String? = null,
+    onPageError: ((message: String) -> Unit)? = null,
 )
 
 interface PebbleWebviewUrlInterceptor {
@@ -19,4 +20,5 @@ interface PebbleWebviewUrlInterceptor {
 interface PebbleWebviewNavigator {
     fun loadUrl(url: String)
     fun goBack(): Boolean
+    fun reload()
 }

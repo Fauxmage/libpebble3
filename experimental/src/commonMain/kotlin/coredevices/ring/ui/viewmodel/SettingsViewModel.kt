@@ -12,6 +12,7 @@ import coredevices.indexai.database.dao.RecordingEntryDao
 import coredevices.libindex.device.IndexDeviceManager
 import coredevices.libindex.device.InterviewedIndexDevice
 import coredevices.libindex.device.KnownIndexDevice
+import coredevices.libindex.di.LibIndexCoroutineScope
 import coredevices.ring.agent.builtin_servlets.notes.NoteIntegrationFactory
 import coredevices.ring.agent.builtin_servlets.notes.NoteProvider
 import coredevices.ring.agent.builtin_servlets.reminders.ReminderProvider
@@ -21,6 +22,7 @@ import coredevices.ring.database.MusicControlMode
 import coredevices.ring.database.Preferences
 import coredevices.ring.database.SecondaryMode
 import coredevices.ring.database.firestore.dao.FirestoreRecordingsDao
+import coredevices.ring.database.room.repository.McpSandboxRepository
 import coredevices.ring.database.room.repository.RecordingRepository
 import coredevices.ring.encryption.DocumentEncryptor
 import coredevices.ring.encryption.EnableEncryptionResult
@@ -29,13 +31,20 @@ import coredevices.ring.encryption.EncryptionSetupState
 import coredevices.ring.encryption.KeyStorageStatus
 import coredevices.ring.encryption.KeyFingerprintMismatchException
 import coredevices.ring.encryption.TamperedException
+import coredevices.ring.RingDelegate
+import coredevices.ring.model.CactusModelProvider
 import coredevices.ring.service.RingSync
 import coredevices.ring.storage.BackupZipReader
+import coredevices.ring.ui.components.QrPhotoPickResult
+import coredevices.ring.ui.components.pickQrCodeFromPhotos
+import coredevices.ring.ui.components.saveQrCodeToPhotos
 import coredevices.ring.storage.BackupZipWriter
 import coredevices.ring.storage.RecordingStorage
 import coredevices.ui.ModelType
 import coredevices.util.CommonBuildKonfig
 import coredevices.util.emailOrNull
+import coredevices.util.isAndroid
+import coredevices.util.isIOS
 import dev.gitlive.firebase.Firebase
 import dev.gitlive.firebase.auth.auth
 import dev.gitlive.firebase.firestore.DocumentSnapshot
@@ -92,6 +101,11 @@ class SettingsViewModel(
     private val itemRepository: coredevices.ring.database.room.repository.ItemRepository,
     private val listRepository: coredevices.ring.database.room.repository.ListRepository,
     private val indexFeedSyncService: coredevices.ring.service.indexfeed.IndexFeedSyncService,
+    private val platform: coredevices.util.Platform,
+    private val mcpSandboxRepository: McpSandboxRepository,
+    private val ringDelegate: RingDelegate,
+    private val cactusModelProvider: CactusModelProvider,
+    private val appScope: LibIndexCoroutineScope,
 ): ViewModel() {
     val version = CommonBuildKonfig.GIT_HASH
     val username = Firebase.auth.authStateChanged
@@ -113,6 +127,12 @@ class SettingsViewModel(
     private val _showSecondaryModeDialog = MutableStateFlow(false)
     val showSecondaryModeDialog = _showSecondaryModeDialog.asStateFlow()
     val secondaryMode = preferences.secondaryMode
+    val secondaryModeMcpGroupId = preferences.secondaryModeMcpGroupId
+    val sandboxGroups = mcpSandboxRepository.getAllGroupsFlow().stateIn(
+        viewModelScope,
+        started = SharingStarted.Lazily,
+        initialValue = emptyList()
+    )
     private val _showNoteShortcutDialog = MutableStateFlow(false)
     val showNoteShortcutDialog = _showNoteShortcutDialog.asStateFlow()
     val noteShortcut = preferences.noteShortcut
@@ -163,9 +183,18 @@ class SettingsViewModel(
 
     private suspend fun updateAvailableReminderProviders() {
         _availableReminderProviders.value = buildList {
-            add(ReminderProvider.Native)
+            add(ReminderProvider.BuiltIn)
+            if (platform.isIOS) {
+                add(ReminderProvider.IOSReminders)
+            }
             if (gTasksIntegration.isAuthorized()) {
                 add(ReminderProvider.GoogleTasks)
+            }
+            // Tasker shares one opt-in across notes & reminders; reuse the note client's auth check.
+            if (platform.isAndroid &&
+                noteIntegrationFactory.createNoteClient(NoteProvider.Tasker).isAuthorized()
+            ) {
+                add(ReminderProvider.Tasker)
             }
         }
     }
@@ -173,18 +202,21 @@ class SettingsViewModel(
     fun onModelDownloadDialogDismissed(success: Boolean) {
         val wasDownloading = _showModelDownloadDialog.value ?: return
         _showModelDownloadDialog.value = null
-        viewModelScope.launch {
+        // appScope: pref write must land even if the user leaves Settings.
+        appScope.launch {
             when (wasDownloading) {
                 is ModelType.Agent -> preferences.setUseCactusAgent(success)
                 is ModelType.STT -> preferences.setUseCactusTranscription(success)
             }
         }
     }
-    
+
     fun toggleCactusAgent() {
-        viewModelScope.launch {
+        appScope.launch {
             if (!_useCactusAgent.value) {
-                _showModelDownloadDialog.value = ModelType.Agent(CommonBuildKonfig.CACTUS_LM_MODEL_NAME)
+                // Trigger LM model extraction, should be already integrated into assets so no DL
+                cactusModelProvider.getLMModelPath()
+                preferences.setUseCactusAgent(true)
             } else {
                 preferences.setUseCactusAgent(false)
             }
@@ -211,8 +243,11 @@ class SettingsViewModel(
         _showSecondaryModeDialog.value = false
     }
 
-    fun setSecondaryMode(mode: SecondaryMode) {
+    fun setSecondaryMode(mode: SecondaryMode, mcpSandboxGroupId: Long? = null) {
         preferences.setSecondaryMode(mode)
+        if (mode == SecondaryMode.McpSandbox) {
+            preferences.setSecondaryModeMcpGroupId(mcpSandboxGroupId)
+        }
     }
 
     fun toggleDebugDetailsEnabled() {
@@ -263,6 +298,10 @@ class SettingsViewModel(
                 _panicPending.value = false
             }
         }
+    }
+
+    fun restartPreemptiveTransfer() {
+        ringDelegate.restartPreemptiveTransfer()
     }
 
     /** Trigger upload of any locally-queued recordings that don't have a
@@ -346,7 +385,7 @@ class SettingsViewModel(
      *  the actual throws — we fall through to the legacy paginated
      *  `getCount()` (slow on big collections, but correct). */
     fun loadBackupCount() {
-        viewModelScope.launch {
+        appScope.launch {
             _backupLoading.value = true
             try {
                 val count = withContext(Dispatchers.IO) {
@@ -364,7 +403,9 @@ class SettingsViewModel(
     }
 
     fun deleteBackup() {
-        viewModelScope.launch {
+        // appScope: a multi-step destructive operation — leaving Settings
+        // mid-way must not abandon it half-done.
+        appScope.launch {
             _backupLoading.value = true
             _backupStatus.value = "Deleting backup..."
             val log = Logger.withTag("Backup")
@@ -373,7 +414,7 @@ class SettingsViewModel(
                 _backupStatus.value = "Collecting audio files..."
                 val audioFileIds = mutableListOf<String>()
                 withContext(Dispatchers.IO) {
-                    var cursor: dev.gitlive.firebase.firestore.DocumentSnapshot? = null
+                    var cursor: DocumentSnapshot? = null
                     while (true) {
                         val snapshot = firestoreRecordingsDao.getPaginated(100, cursor)
                         val docs = snapshot.documents
@@ -384,7 +425,7 @@ class SettingsViewModel(
                                 for (entry in recording.entries) {
                                     val fileName = entry.fileName ?: continue
                                     audioFileIds.add(fileName)
-                                    audioFileIds.add("$fileName-clean")
+                                    audioFileIds.add("$fileName-original")
                                 }
                             } catch (_: Exception) {}
                         }
@@ -430,7 +471,8 @@ class SettingsViewModel(
     }
 
     fun deleteLocalFeed() {
-        viewModelScope.launch {
+        // appScope: same as deleteBackup — must run to completion.
+        appScope.launch {
             _backupLoading.value = true
             _backupStatus.value = "Deleting local feed..."
             val log = Logger.withTag("Backup")
@@ -483,14 +525,33 @@ class SettingsViewModel(
         viewModelScope.launch {
             _encryptionKeyLoading.value = true
             try {
-                encryptionManager.generateAndStoreKey(uiContext)
-                _encryptionKeyStatus.value = "Encryption key generated and saved"
+                val key = encryptionManager.generateAndStoreKey(uiContext)
+                // Save the QR (and let iOS show its photos prompt) before
+                // revealing the key dialog, which would cover the prompt.
+                val qrSaved = trySaveKeyQrToPhotos(uiContext, key)
+                encryptionManager.revealGeneratedKey(key)
+                _encryptionKeyStatus.value = if (qrSaved) {
+                    "Encryption key generated — QR code saved to your photos"
+                } else {
+                    "Encryption key generated and saved"
+                }
             } catch (e: Exception) {
                 _encryptionKeyStatus.value = "Failed: ${e.message}"
             } finally {
                 _encryptionKeyLoading.value = false
             }
         }
+    }
+
+    /** Back the key up as a QR code in the photo library; never fails the key flow. */
+    private suspend fun trySaveKeyQrToPhotos(
+        uiContext: PlatformUiContext,
+        keyBase64: String,
+    ): Boolean = try {
+        saveQrCodeToPhotos(uiContext, keyBase64, "Index encryption key.png")
+    } catch (e: Exception) {
+        Logger.withTag("Encryption").w(e) { "Could not save key QR code to photos" }
+        false
     }
 
     fun readKeyFromCloudKeychain(uiContext: PlatformUiContext) {
@@ -597,16 +658,15 @@ class SettingsViewModel(
         viewModelScope.launch {
             _encryptionSetup.value = EncryptionSetupState.Generating
             try {
-                encryptionManager.generateAndStoreKey(uiContext)
-                // We show the key in the wizard ourselves; clear the shared
-                // `generatedKey` so the standalone QR dialog doesn't double-show.
-                val key = encryptionManager.generatedKey.value
-                encryptionManager.clearGeneratedKey()
-                _encryptionSetup.value = if (key != null) {
-                    EncryptionSetupState.ShowKey(key)
-                } else {
-                    EncryptionSetupState.Failed("Key generation failed")
-                }
+                val key = encryptionManager.generateAndStoreKey(uiContext)
+                // Hide the wizard while the QR is saved — on iOS the photos
+                // permission prompt would otherwise show underneath it.
+                _encryptionSetup.value = EncryptionSetupState.Hidden
+                val qrSaved = trySaveKeyQrToPhotos(uiContext, key)
+                _encryptionSetup.value = EncryptionSetupState.ShowKey(
+                    keyBase64 = key,
+                    qrSavedToPhotos = qrSaved,
+                )
             } catch (e: Exception) {
                 _encryptionSetup.value =
                     EncryptionSetupState.Failed(e.message ?: "Key generation failed")
@@ -629,6 +689,80 @@ class SettingsViewModel(
             } else {
                 _encryptionSetup.value =
                     EncryptionSetupState.PasteKey("That key isn't valid for this account")
+            }
+        }
+    }
+
+    /** "Import from QR" on the paste step — pick the key QR photo and restore it. */
+    fun restoreFromQrPhoto(uiContext: PlatformUiContext) {
+        viewModelScope.launch {
+            try {
+                when (val result = pickQrCodeFromPhotos(uiContext)) {
+                    is QrPhotoPickResult.Found -> {
+                        _encryptionSetup.value = EncryptionSetupState.Restoring
+                        if (encryptionManager.restoreKeyFromString(result.data)) {
+                            finishSetupAndEnable()
+                        } else {
+                            _encryptionSetup.value = EncryptionSetupState.PasteKey(
+                                "That QR code isn't a valid key for this account"
+                            )
+                        }
+                    }
+                    QrPhotoPickResult.NoQrFound ->
+                        _encryptionSetup.value =
+                            EncryptionSetupState.PasteKey("No QR code found in that photo")
+                    QrPhotoPickResult.Cancelled -> {}
+                }
+            } catch (e: Exception) {
+                Logger.withTag("Encryption").w(e) { "QR key import failed" }
+                _encryptionSetup.value =
+                    EncryptionSetupState.PasteKey(e.message ?: "QR import failed")
+            }
+        }
+    }
+
+    /** Settings-list QR import, reporting through [encryptionKeyStatus]. */
+    fun importKeyFromQrPhoto(uiContext: PlatformUiContext) {
+        viewModelScope.launch {
+            _encryptionKeyLoading.value = true
+            try {
+                when (val result = pickQrCodeFromPhotos(uiContext)) {
+                    is QrPhotoPickResult.Found ->
+                        _encryptionKeyStatus.value =
+                            if (encryptionManager.restoreKeyFromString(result.data)) {
+                                "Key imported from QR code"
+                            } else {
+                                "That QR code isn't a valid key for this account"
+                            }
+                    QrPhotoPickResult.NoQrFound ->
+                        _encryptionKeyStatus.value = "No QR code found in that photo"
+                    QrPhotoPickResult.Cancelled -> {}
+                }
+            } catch (e: Exception) {
+                _encryptionKeyStatus.value = "QR import failed: ${e.message}"
+            } finally {
+                _encryptionKeyLoading.value = false
+            }
+        }
+    }
+
+    /** Settings-list manual key entry, reporting through [encryptionKeyStatus]. */
+    fun importKeyFromText(keyBase64: String) {
+        val key = keyBase64.trim()
+        if (key.isEmpty()) return
+        viewModelScope.launch {
+            _encryptionKeyLoading.value = true
+            try {
+                _encryptionKeyStatus.value =
+                    if (encryptionManager.restoreKeyFromString(key)) {
+                        "Key imported from text"
+                    } else {
+                        "That key isn't valid for this account"
+                    }
+            } catch (e: Exception) {
+                _encryptionKeyStatus.value = "Key import failed: ${e.message}"
+            } finally {
+                _encryptionKeyLoading.value = false
             }
         }
     }
@@ -757,7 +891,7 @@ class SettingsViewModel(
                         // Download audio files for each entry
                         for (entry in doc.entries) {
                             val fileName = entry.fileName ?: continue
-                            for (variant in listOf(fileName, "$fileName-clean")) {
+                            for (variant in listOf(fileName, "$fileName-original")) {
                                 try {
                                     val (source, meta) = recordingStorage.openRecordingSource(variant)
                                     source.use { src ->
@@ -854,7 +988,7 @@ class SettingsViewModel(
                         }
                         val audioFiles = doc.entries.flatMap { entry ->
                             val fileName = entry.fileName ?: return@flatMap emptyList()
-                            listOf(fileName, "$fileName-clean").mapNotNull { variant ->
+                            listOf(fileName, "$fileName-original").mapNotNull { variant ->
                                 val rawEntry = entryMap["recordings/$dirId/$variant.raw"] ?: return@mapNotNull null
                                 val metaEntry = entryMap["recordings/$dirId/$variant.meta.json"]
                                 var sampleRate = 16000; var mimeType = "audio/raw"

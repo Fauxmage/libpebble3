@@ -20,6 +20,7 @@ import io.rebble.libpebblecommon.util.obfuscate
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
+import java.util.TimeZone
 import kotlin.time.Instant
 
 
@@ -31,6 +32,7 @@ private val calendarProjection = arrayOf(
     CalendarContract.Calendars.OWNER_ACCOUNT,
     CalendarContract.Calendars.CALENDAR_COLOR,
     CalendarContract.Calendars.SYNC_EVENTS,
+    CalendarContract.Calendars.VISIBLE,
 )
 
 private val instanceUri: Uri = CalendarContract.Instances.CONTENT_URI
@@ -374,6 +376,9 @@ class AndroidSystemCalendar(
                             val syncEvents =
                                 cursor.getNullableColumnIndex(CalendarContract.Calendars.SYNC_EVENTS)
                                     ?.let { cursor.getInt(it) }
+                            val visible =
+                                cursor.getNullableColumnIndex(CalendarContract.Calendars.VISIBLE)
+                                    ?.let { cursor.getInt(it) }
 
                             CalendarEntity(
                                 platformId = id.toString(),
@@ -383,6 +388,7 @@ class AndroidSystemCalendar(
                                 color = color,
                                 enabled = true,
                                 syncEvents = syncEvents == 1,
+                                visible = visible == 1,
                             )
                         } else {
                             null
@@ -425,10 +431,12 @@ class AndroidSystemCalendar(
     }
 
     override suspend fun enableSyncForCalendar(calendar: CalendarEntity) {
-        // Create the update URI for this specific calendar
-        val updateUri = ContentUris.withAppendedId(calendarUri, calendar.id.toLong())
+        // Create the update URI for this specific calendar. platformId is the provider's calendar
+        // _id; calendar.id is our local Room PK and must not be used to address the provider.
+        val updateUri = ContentUris.withAppendedId(calendarUri, calendar.platformId.toLong())
         val values = ContentValues().apply {
             put(CalendarContract.Calendars.SYNC_EVENTS, 1)
+            put(CalendarContract.Calendars.VISIBLE, 1)
         }
 
         try {
@@ -472,6 +480,74 @@ class AndroidSystemCalendar(
     override fun hasPermission(): Boolean {
         return appContext.context.checkSelfPermission(Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED &&
                     appContext.context.checkSelfPermission(Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED
+    }
+
+    override suspend fun createEvent(event: NewCalendarEvent): String? {
+        val calendarId = findPrimaryWritableCalendarId() ?: run {
+            logger.w("No writable calendar found to create event")
+            return null
+        }
+        val values = ContentValues().apply {
+            put(CalendarContract.Events.CALENDAR_ID, calendarId)
+            put(CalendarContract.Events.TITLE, event.title)
+            event.description?.let { put(CalendarContract.Events.DESCRIPTION, it) }
+            event.location?.let { put(CalendarContract.Events.EVENT_LOCATION, it) }
+            put(CalendarContract.Events.DTSTART, event.startTime.toEpochMilliseconds())
+            put(CalendarContract.Events.DTEND, event.endTime.toEpochMilliseconds())
+            put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
+        }
+        return try {
+            val uri = contentResolver.insert(eventUri, values)
+            val id = uri?.let { ContentUris.parseId(it).toString() }
+            logger.d("Created calendar event in calendar $calendarId -> $id")
+            id
+        } catch (e: Exception) {
+            logger.e(e) { "Failed to create calendar event" }
+            null
+        }
+    }
+
+    /**
+     * Best calendar to create events in: the account's own primary calendar
+     * (where ownerAccount == accountName), else the first calendar we can write to.
+     *
+     * Deliberately does NOT order by IS_PRIMARY — that is a computed column that some calendar
+     * providers reject in a sort clause (the query then throws / returns null), which would make
+     * event creation silently fail even when writable calendars exist.
+     */
+    private fun findPrimaryWritableCalendarId(): Long? {
+        val projection = arrayOf(
+            CalendarContract.Calendars._ID,
+            CalendarContract.Calendars.ACCOUNT_NAME,
+            CalendarContract.Calendars.OWNER_ACCOUNT,
+            CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL,
+        )
+        return try {
+            contentResolver.query(
+                calendarUri,
+                projection,
+                "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ?",
+                arrayOf(CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR.toString()),
+                null
+            )?.use { cursor ->
+                var firstWritable: Long? = null
+                var ownPrimary: Long? = null
+                while (cursor.moveToNext()) {
+                    val id = cursor.getNullableColumnIndex(CalendarContract.Calendars._ID)
+                        ?.let { cursor.getLong(it) } ?: continue
+                    if (firstWritable == null) firstWritable = id
+                    val account = cursor.getNullableColumnIndex(CalendarContract.Calendars.ACCOUNT_NAME)
+                        ?.let { cursor.getString(it) }
+                    val owner = cursor.getNullableColumnIndex(CalendarContract.Calendars.OWNER_ACCOUNT)
+                        ?.let { cursor.getString(it) }
+                    if (ownPrimary == null && account != null && account == owner) ownPrimary = id
+                }
+                ownPrimary ?: firstWritable
+            }
+        } catch (e: Exception) {
+            logger.e(e) { "Error querying calendars for event creation" }
+            null
+        }
     }
 
     override fun supportsPinActions(): Boolean = true

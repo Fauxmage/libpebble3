@@ -1,15 +1,20 @@
 package coredevices.ring.service.recordings.button
 
+import co.touchlab.kermit.Logger
+import coredevices.indexai.database.dao.LocalRecordingDao
 import coredevices.indexai.database.dao.RecordingEntryDao
 import coredevices.ring.external.indexwebhook.IndexWebhookApi
 import coredevices.ring.external.indexwebhook.IndexWebhookPayloadMode
 import coredevices.ring.external.indexwebhook.IndexWebhookPreferences
 import coredevices.ring.service.recordings.RecordingProcessingQueue
 import coredevices.ring.storage.RecordingStorage
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.io.buffered
 import kotlinx.io.readShortLe
 import org.koin.core.component.KoinComponent
 import org.koin.core.component.inject
+import kotlin.time.Clock
 
 /**
  * Decorator that uploads recording data to a user-configured webhook endpoint
@@ -27,11 +32,23 @@ class IndexWebhookUploadRecordingOperation(
     private val recordingId: Long
 ): RecordingOperation, KoinComponent {
 
+    companion object {
+        private val logger = Logger.withTag("IndexWebhookUploadRecordingOperation")
+        private val sentRecordingIds = mutableSetOf<String>()
+        private val sentRecordingIdsLock = Mutex()
+    }
+
     private val recordingEntryDao: RecordingEntryDao by inject()
+    private val localRecordingDao: LocalRecordingDao by inject()
 
     override suspend fun run(handle: RecordingProcessingQueue.TaskHandle?) {
         // Run the inner operation first (transcription + agent processing)
         decorated.run(handle)
+
+        if (!sentRecordingIdsLock.withLock { sentRecordingIds.add(fileId) }) {
+            logger.d { "Webhook already sent for recording $fileId, skipping" }
+            return
+        }
 
         val payloadMode = webhookPreferences.payloadMode.value
 
@@ -57,6 +74,9 @@ class IndexWebhookUploadRecordingOperation(
             recordingEntryDao.getMostRecentEntryForRecording(recordingId)?.transcription
         } else null
 
-        webhookApi.uploadIfEnabled(samples, sampleRate, fileId, transcription)
+        val recordedAt = localRecordingDao.getRecording(recordingId)?.localTimestamp
+            ?: Clock.System.now()
+
+        webhookApi.uploadIfEnabled(samples, sampleRate, fileId, transcription, recordedAt)
     }
 }

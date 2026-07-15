@@ -92,6 +92,7 @@ class LibPebbleNotificationListener : NotificationListenerService(), LibPebbleKo
         logger.d { "onListenerDisconnected() ($this)" }
         connection.setService(null)
         notificationListenerScope.cancel()
+        connection.onListenerDisconnected()
     }
 
     override fun onNotificationChannelModified(
@@ -229,5 +230,16 @@ class LibPebbleNotificationListener : NotificationListenerService(), LibPebbleKo
         val ranking = Ranking()
         return rankingMap.getRanking(statusBarNotification.getKey(), ranking) &&
                 !ranking.matchesInterruptionFilter()
+    }
+
+    fun isBindingAlive(): Boolean = try {
+        getActiveNotifications()
+        true
+    } catch (e: SecurityException) {
+        logger.w(e) { "Notification listener binding appears dead (getActiveNotifications threw)" }
+        false
+    } catch (e: Exception) {
+        logger.e(e) { "Unexpected error probing notification listener binding; assuming alive" }
+        true
     }
 }

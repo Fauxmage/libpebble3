@@ -134,7 +134,11 @@ fun BugReportScreen(
 ) {
     Box(modifier = Modifier.background(MaterialTheme.colorScheme.background)) {
         val platform = koinInject<Platform>()
-        var isWatch by remember { mutableStateOf(pebble) }
+        // Watch screenshot capture / stored-watch detection
+        val libPebble = rememberLibPebble()
+        val watches by libPebble.watches.collectAsState()
+        // Default to an Index bug report when there are no watches stored in libpebble.
+        var isWatch by remember { mutableStateOf(pebble && watches.isNotEmpty()) }
         val coreConfigFlow: CoreConfigFlow = koinInject()
         val coreConfig by coreConfigFlow.flow.collectAsState()
         val bugReportProcessor = koinInject<BugReportProcessor>()
@@ -143,6 +147,7 @@ fun BugReportScreen(
         val (sending, setSending) = remember { mutableStateOf(false) }
         val (showSuccess, setShowSuccess) = remember { mutableStateOf(false) }
         val (sendRecording, setSendRecording) = remember { mutableStateOf(recordingPath != null) }
+        val (sendRecentRecordings, setSendRecentRecordings) = remember { mutableStateOf(true) }
         val (attachments, setAttachments) = remember {
             mutableStateOf<List<DocumentAttachment>?>(
                 null
@@ -178,9 +183,6 @@ fun BugReportScreen(
         val snackbarHostState = remember { SnackbarHostState() }
         var showSignInDialog by remember { mutableStateOf(false) }
 
-        // Watch screenshot capture
-        val libPebble = rememberLibPebble()
-        val watches by libPebble.watches.collectAsState()
         val connectedScreenshotWatch = remember(watches) {
             watches.filterIsInstance<ConnectedPebble.Screenshot>().firstOrNull()
         }
@@ -216,6 +218,7 @@ fun BugReportScreen(
                     screenContext = nextBugReportContext.nextContext ?: "",
                     attachments = attachments ?: emptyList(),
                     sendRecording = sendRecording,
+                    sendRecentRecordings = !isWatch && sendRecentRecordings,
                     expOutputPath = recordingPath,
                     imageAttachments = (imageAttachments ?: emptyList()) +
                             if (capturedPngBytes != null) {
@@ -450,6 +453,19 @@ fun BugReportScreen(
                         Checkbox(sendRecording, { setSendRecording(it) }, enabled = !sending)
                         Text(
                             "Include recording",
+                            modifier = Modifier.align(Alignment.CenterVertically)
+                        )
+                    }
+                }
+                if (coreConfig.enableIndex && !isWatch) {
+                    Row(
+                        modifier = Modifier.clickable(
+                            interactionSource = null,
+                            indication = null
+                        ) { setSendRecentRecordings(!sendRecentRecordings) }) {
+                        Checkbox(sendRecentRecordings, { setSendRecentRecordings(it) }, enabled = !sending)
+                        Text(
+                            "Include recent recordings",
                             modifier = Modifier.align(Alignment.CenterVertically)
                         )
                     }

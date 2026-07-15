@@ -197,6 +197,7 @@ kotlin {
             implementation(compose.foundation)
             implementation(libs.compose.material3)
             implementation(compose.ui)
+            implementation(libs.backhandler)
             implementation(compose.materialIconsExtended)
             implementation(compose.components.resources)
             implementation(compose.components.uiToolingPreview)
@@ -229,6 +230,9 @@ kotlin {
             api(project(":mcp"))
             implementation(libs.health.kmp)
         }
+    }
+    sourceSets.androidInstrumentedTest.dependencies {
+        implementation(kotlin("test"))
     }
 }
 

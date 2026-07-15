@@ -26,7 +26,7 @@ class NullTranscriptionService: TranscriptionService {
         dictionaryContext: List<String>?,
         contentContext: String?,
         encoding: AudioEncoding,
-        timeout: Duration,
+        initialTimeout: Duration?,
     ): Flow<TranscriptionSessionStatus> = flow {
         emit(TranscriptionSessionStatus.Open)
         logger.v { "Transcription flow opened" }

@@ -7,6 +7,7 @@ import androidx.room.RoomDatabase
 import androidx.room.RoomDatabaseConstructor
 import androidx.room.TypeConverters
 import androidx.room.migration.AutoMigrationSpec
+import androidx.room.migration.Migration
 import androidx.sqlite.SQLiteConnection
 import androidx.sqlite.driver.bundled.BundledSQLiteDriver
 import androidx.sqlite.execSQL
@@ -14,15 +15,16 @@ import io.rebble.libpebblecommon.connection.AppContext
 import io.rebble.libpebblecommon.database.dao.CalendarDao
 import io.rebble.libpebblecommon.database.dao.ContactDao
 import io.rebble.libpebblecommon.database.dao.HealthDao
+import io.rebble.libpebblecommon.database.dao.HealthSettingsEntryRealDao
 import io.rebble.libpebblecommon.database.dao.KnownWatchDao
 import io.rebble.libpebblecommon.database.dao.LockerAppPermissionDao
 import io.rebble.libpebblecommon.database.dao.LockerEntryRealDao
 import io.rebble.libpebblecommon.database.dao.NotificationAppRealDao
 import io.rebble.libpebblecommon.database.dao.NotificationDao
+import io.rebble.libpebblecommon.database.dao.NotificationRuleDao
 import io.rebble.libpebblecommon.database.dao.TimelineNotificationRealDao
 import io.rebble.libpebblecommon.database.dao.TimelinePinRealDao
 import io.rebble.libpebblecommon.database.dao.TimelineReminderRealDao
-import io.rebble.libpebblecommon.database.dao.NotificationRuleDao
 import io.rebble.libpebblecommon.database.dao.VibePatternDao
 import io.rebble.libpebblecommon.database.dao.WatchPrefRealDao
 import io.rebble.libpebblecommon.database.dao.WeatherAppRealDao
@@ -32,8 +34,6 @@ import io.rebble.libpebblecommon.database.entity.AppPrefsEntrySyncEntity
 import io.rebble.libpebblecommon.database.entity.CalendarEntity
 import io.rebble.libpebblecommon.database.entity.ContactEntity
 import io.rebble.libpebblecommon.database.entity.HealthDataEntity
-import io.rebble.libpebblecommon.database.dao.HealthSettingsEntryRealDao
-import io.rebble.libpebblecommon.database.entity.HealthSettingsEntryDao
 import io.rebble.libpebblecommon.database.entity.HealthSettingsEntryEntity
 import io.rebble.libpebblecommon.database.entity.HealthSettingsEntrySyncEntity
 import io.rebble.libpebblecommon.database.entity.HealthStatDao
@@ -96,7 +96,7 @@ internal const val DATABASE_FILENAME = "libpebble3.db"
         AppPrefsEntrySyncEntity::class,
         NotificationRuleEntity::class,
     ],
-    version = 37,
+    version = 40,
     autoMigrations = [
         AutoMigration(from = 10, to = 11),
         AutoMigration(from = 11, to = 12),
@@ -124,7 +124,9 @@ internal const val DATABASE_FILENAME = "libpebble3.db"
         AutoMigration(from = 33, to = 34),
         AutoMigration(from = 34, to = 35),
         AutoMigration(from = 35, to = 36),
-        AutoMigration(from = 36, to = 37, spec = AutoMigration37::class),
+        AutoMigration(from = 36, to = 37),
+        AutoMigration(from = 37, to = 38),
+        AutoMigration(from = 38, to = 39),
     ],
     exportSchema = true,
 )
@@ -155,23 +157,22 @@ abstract class Database : RoomDatabase() {
 @DeleteTable(tableName = "WatchSettingsSyncEntity")
 class AutoMigration30 : AutoMigrationSpec
 
-class AutoMigration37 : AutoMigrationSpec {
-    override fun onPostMigrate(connection: SQLiteConnection) {
-        connection.execSQL(
-            "UPDATE NotificationAppItemEntity SET allowDuplicates = 1 WHERE packageName = 'com.ringapp'"
-        )
-    }
-}
-
 
 @Suppress("NO_ACTUAL_FOR_EXPECT")
 expect object DatabaseConstructor : RoomDatabaseConstructor<Database> {
     override fun initialize(): Database
 }
 
+// Force re-sync of all app metadata after fixing SDK version selection
+val MIGRATION_39_40 = object : Migration(39, 40) {
+    override fun migrate(connection: SQLiteConnection) {
+        connection.execSQL("UPDATE LockerEntrySyncEntity SET watchSynchHashcode = watchSynchHashcode + 1")
+    }
+}
+
 fun getRoomDatabase(ctx: AppContext): Database {
     return getDatabaseBuilder(ctx)
-        //.addMigrations()
+        .addMigrations(MIGRATION_39_40)
         .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
         // V7 required a full re-create.
         .fallbackToDestructiveMigrationFrom(dropAllTables = true, 1, 2, 3, 4, 5, 6, 7, 8, 9)

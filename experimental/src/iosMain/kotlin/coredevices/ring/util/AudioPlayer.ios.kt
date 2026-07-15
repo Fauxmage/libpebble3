@@ -1,5 +1,6 @@
 package coredevices.ring.util
 
+import co.touchlab.kermit.Logger
 import coredevices.util.AudioEncoding
 import kotlinx.cinterop.ObjCObjectVar
 import kotlinx.cinterop.addressOf
@@ -12,13 +13,17 @@ import kotlinx.cinterop.ptr
 import kotlinx.cinterop.refTo
 import kotlinx.cinterop.usePinned
 import kotlinx.cinterop.value
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.withContext
 import kotlinx.io.Source
 import kotlinx.io.readShortLe
@@ -40,6 +45,9 @@ import platform.AVFAudio.setActive
 import platform.Foundation.create
 import platform.darwin.NSObject
 import kotlin.coroutines.resume
+
+// Number of PCM buffers to keep scheduled ahead of playback to avoid gaps between chunks.
+private const val BUFFERS_IN_FLIGHT = 3
 
 private fun activateAudioSession() = memScoped {
     val err = alloc<ObjCObjectVar<NSError?>>()
@@ -68,8 +76,15 @@ fun AudioEncoding.toAVAudioFormat(sampleRate: Int, channels: Int = 1) = when (th
 }
 
 actual class AudioPlayer actual constructor() : AutoCloseable {
+    private val logger = Logger.withTag(AudioPlayer::class.simpleName!!)
     actual val playbackState: MutableStateFlow<PlaybackState> = MutableStateFlow(PlaybackState.Stopped)
-    private val scope = CoroutineScope(Dispatchers.IO)
+    // Reading the playback Source can throw (e.g. a closed/unreadable Source). Without a handler
+    // that would escape the launched coroutine and crash the whole app, so swallow it here.
+    private val exceptionHandler = CoroutineExceptionHandler { _, throwable ->
+        logger.e(throwable) { "Playback failed" }
+        playbackState.value = PlaybackState.Stopped
+    }
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob() + exceptionHandler)
     private var playJob: Job? = null
 
     actual fun playRaw(
@@ -105,32 +120,40 @@ actual class AudioPlayer actual constructor() : AutoCloseable {
                 avAudioPlayerNode.setVolume(AUDIO_PLAYER_VOLUME)
                 avAudioPlayerNode.play()
             }
-            val buffer = AVAudioPCMBuffer(
-                avFormat,
-                sampleSizeHint.coerceIn(1024, 4096).toUInt()
-            )
-            val data = buffer.floatChannelData!![0]!!
             playbackState.value = PlaybackState.Playing(0.0)
 
-            val divBuffer = FloatArray(buffer.frameCapacity.toInt())
+            // Keep several buffers scheduled ahead of playback so the player node never runs
+            // dry between chunks. Reusing a single buffer and waiting for each chunk to finish
+            // playing before scheduling the next leaves a gap with nothing queued, which is
+            // audible as stuttering (MOB-8075). The semaphore bounds how far we read ahead.
+            val chunkCapacity = sampleSizeHint.coerceIn(1024, 4096).toInt()
+            val divBuffer = FloatArray(chunkCapacity)
+            val inFlight = Semaphore(BUFFERS_IN_FLIGHT)
+            val job = coroutineContext.job
             while (!samples.exhausted()) {
                 var samplesRead = 0
-                while (samplesRead < divBuffer.size && !samples.exhausted()) {
+                while (samplesRead < chunkCapacity && !samples.exhausted()) {
                     val short = samples.readShortLe()
                     divBuffer[samplesRead] = short.toFloat() / Short.MAX_VALUE
                     samplesRead++
                 }
-                val ptr = divBuffer.refTo(0)
-                memcpy(data, ptr, samplesRead.toULong() * 4u)
+                if (samplesRead == 0) break
+                val buffer = AVAudioPCMBuffer(avFormat, chunkCapacity.toUInt())
+                memcpy(buffer.floatChannelData!![0]!!, divBuffer.refTo(0), samplesRead.toULong() * 4u)
                 buffer.frameLength = samplesRead.toUInt()
-                suspendCancellableCoroutine<Unit> { continuation ->
-                    avAudioPlayerNode.scheduleBuffer(buffer) {
-                        continuation.resume(Unit)
+
+                inFlight.acquire()
+                val chunkSamples = samplesRead
+                avAudioPlayerNode.scheduleBuffer(buffer) {
+                    playbackProgress += chunkSamples
+                    if (job.isActive) {
+                        playbackState.value = PlaybackState.Playing(playbackProgress.toDouble() / sampleSizeHint)
                     }
+                    inFlight.release()
                 }
-                playbackProgress += samplesRead
-                playbackState.value = PlaybackState.Playing(playbackProgress.toDouble() / sampleSizeHint)
             }
+            // Wait for the buffers still queued to finish playing before tearing down the engine.
+            repeat(BUFFERS_IN_FLIGHT) { inFlight.acquire() }
         }.also {
             it.invokeOnCompletion {
                 avAudioPlayerNode.stop()

@@ -2,9 +2,6 @@ package coredevices.ring.ui.navigation
 
 import CoreNav
 import CoreRoute
-import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.navigation.NavDeepLink
 import androidx.navigation.NavGraphBuilder
 import androidx.navigation.compose.composable
@@ -16,17 +13,13 @@ import coredevices.ring.ui.screens.indexfeed.AllAnswers
 import coredevices.ring.ui.screens.indexfeed.AllLists
 import coredevices.ring.ui.screens.indexfeed.FullFeed
 import coredevices.ring.ui.screens.indexfeed.ObjectDetail
-import coredevices.ring.ui.screens.notes.ReminderDetails
 import coredevices.ring.ui.screens.recording.RecordingDetails
 import coredevices.ring.ui.screens.settings.NotionOAuthResult
 import coredevices.ring.ui.screens.settings.IndexSettings
 import kotlinx.serialization.Serializable
-import coredevices.ring.database.room.repository.McpSandboxRepository
 import coredevices.ring.ui.screens.RingSyncInspectorScreen
 import coredevices.ring.ui.screens.settings.AddIntegration
-import coredevices.ring.ui.screens.settings.McpSandboxSettings
-import kotlinx.coroutines.flow.flow
-import org.koin.compose.koinInject
+import coredevices.ring.ui.screens.settings.mcp.McpSandboxGroups
 
 /** Marker for routes that belong to the Index/Ring feature. The
  *  WatchHomeScreen registers these in its inner NavHost too so they
@@ -38,8 +31,6 @@ interface RingRoute : CoreRoute
 object RingRoutes {
     @Serializable
     class RecordingDetails(val recordingId: Long) : RingRoute
-    @Serializable
-    class ReminderDetails(val reminderId: Int) : RingRoute
     /** Detail page for an item (`note`/`reminder`/`scheduled`/`message`/
      *  `answer`/`action_log`) or a list. The id is the Firestore doc id.
      *  When [startEditing] is true and the object is a list, the screen
@@ -63,19 +54,25 @@ object RingRoutes {
     @Serializable
     data object RingSyncInspector : RingRoute
     @Serializable
-    data object McpSandboxSettings : RingRoute
+    data object McpSandboxGroups : RingRoute
     @Serializable
     data object AddIntegration : RingRoute
+
+    /** Deep link that opens the [ObjectDetails] screen for an index item by
+     *  its Firestore id. Used by the platform reminder notification so
+     *  tapping it opens the reminder's feed item. Parsed by
+     *  `CoreDeepLinkHandler`. */
+    const val OBJECT_DEEP_LINK_HOST = "deep-link"
+    const val OBJECT_DEEP_LINK_PATH = "object"
+    const val OBJECT_DEEP_LINK_ID_PARAM = "id"
+    fun objectDeepLink(objectId: String) =
+        "pebblecore://$OBJECT_DEEP_LINK_HOST/$OBJECT_DEEP_LINK_PATH?$OBJECT_DEEP_LINK_ID_PARAM=$objectId"
 }
 
 fun NavGraphBuilder.addRingRoutes(coreNav: CoreNav) {
     composable<RingRoutes.RecordingDetails> {
         val route: RingRoutes.RecordingDetails = it.toRoute()
         RecordingDetails(route.recordingId, coreNav)
-    }
-    composable<RingRoutes.ReminderDetails> {
-        val route: RingRoutes.ReminderDetails = it.toRoute()
-        ReminderDetails(coreNav, route.reminderId)
     }
     composable<RingRoutes.ObjectDetails> {
         val route: RingRoutes.ObjectDetails = it.toRoute()
@@ -112,12 +109,8 @@ fun NavGraphBuilder.addRingRoutes(coreNav: CoreNav) {
     composable<RingRoutes.RingSyncInspector> {
         RingSyncInspectorScreen(coreNav)
     }
-    composable<RingRoutes.McpSandboxSettings> {
-        val repo = koinInject<McpSandboxRepository>()
-        val defaultGroup by remember { flow{ emit(repo.getDefaultGroupId()) } }.collectAsState(initial = null)
-        defaultGroup?.let {
-            McpSandboxSettings(coreNav, it)
-        }
+    composable<RingRoutes.McpSandboxGroups> {
+        McpSandboxGroups(coreNav)
     }
     composable<RingRoutes.AddIntegration> {
         AddIntegration(coreNav)

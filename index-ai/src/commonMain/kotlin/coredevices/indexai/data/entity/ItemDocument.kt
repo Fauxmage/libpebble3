@@ -37,12 +37,23 @@ data class ItemDocument(
     val sourceToolCallId: String? = null,
     val metadata: ItemMetadata = ItemMetadata.Note,
     val deleted: Boolean = false,
+    val encrypted: EncryptedEnvelope? = null,
 ) {
     @Serializable
     sealed interface ItemMetadata {
         @Serializable
         @SerialName("reminder")
-        data class Reminder(val repeat: String, val notification: String) : ItemMetadata
+        data class Reminder(
+            val repeat: String,
+            val notification: String,
+            /** Platform-local reminder id this item was created from, letting the
+             *  local reminder notification deep link back to this item. Defaults to
+             *  null for items decoded from older records. */
+            val localReminderId: Int? = null,
+            /** Lead time (ms) before [dueAt] at which an extra early "heads-up"
+             *  notification was scheduled, or null if none. */
+            val notifyBeforeMillis: Long? = null,
+        ) : ItemMetadata
 
         @Serializable
         @SerialName("scheduled")
@@ -83,6 +94,16 @@ data class ItemDocument(
         }
 
         @Serializable
+        @SerialName("calendar_event")
+        data class CalendarEvent(
+            @Serializable(with = InstantComponentSerializer::class)
+            val startTime: Instant,
+            @Serializable(with = InstantComponentSerializer::class)
+            val endTime: Instant,
+            val location: String? = null,
+        ) : ItemMetadata
+
+        @Serializable
         @SerialName("answer")
         data class Answer(val question: String) : ItemMetadata
 
@@ -97,5 +118,24 @@ data class ItemDocument(
         @Serializable
         @SerialName("note")
         object Note : ItemMetadata
+
+        /**
+         * A note-shaped item that the user has explicitly asked to render
+         * with a tickable checkbox. Lives alongside `Note` in the same
+         * notes-domain lists (Notes to self, custom note lists) — the
+         * difference is purely how the UI renders it.
+         */
+        @Serializable
+        @SerialName("checklist")
+        object Checklist : ItemMetadata
+
+        /**
+         * Marker for a note/reminder handed to an external integration rather than stored
+         * locally — the real object lives in that service. [integration] is the provider's
+         * display name (e.g. "Notion", "Google Tasks") so the feed can say "Sent to X".
+         */
+        @Serializable
+        @SerialName("delegated")
+        data class DelegatedToIntegration(val integration: String) : ItemMetadata
     }
 }

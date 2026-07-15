@@ -11,6 +11,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.ExperimentalTime
 
 /**
@@ -31,14 +32,20 @@ val ItemMetadata.kind: String get() = when (this) {
     is ItemMetadata.Reminder -> "reminder"
     is ItemMetadata.Scheduled -> "scheduled"
     is ItemMetadata.Message -> "message"
+    is ItemMetadata.CalendarEvent -> "calendar_event"
     is ItemMetadata.Answer -> "answer"
     is ItemMetadata.ActionLog -> "action_log"
     is ItemMetadata.McpCall -> "mcp_call"
+    is ItemMetadata.DelegatedToIntegration -> "delegated"
     ItemMetadata.Note -> "note"
+    ItemMetadata.Checklist -> "checklist"
 }
 
 val CachedItem.kind: String get() = metadata.kind
 val ItemDocument.kind: String get() = metadata.kind
+
+val CachedItem.displayTitle: String get() = if (locked) "🔒 Encrypted" else title
+val CachedList.displayTitle: String get() = if (locked) "🔒 Encrypted" else title
 
 /**
  * Re-serialise the metadata to a flat JSON object the UI can read by key.
@@ -50,6 +57,7 @@ private fun ItemMetadata.toFieldsJsonObject(): JsonObject {
         is ItemMetadata.Reminder -> buildJsonObject {
             put("repeat", repeat)
             put("notification", notification)
+            notifyBeforeMillis?.let { put("notifyBeforeMillis", it) }
         }
         is ItemMetadata.Scheduled -> buildJsonObject {
             put("fireKind", when (fireKind) {
@@ -57,7 +65,7 @@ private fun ItemMetadata.toFieldsJsonObject(): JsonObject {
                 ItemMetadata.Scheduled.FireKind.Timer -> "timer"
             })
             fireTime?.let { put("fireTime", it.toString().substringBefore('.').take(5)) }
-            duration?.let { put("duration", it) }
+            duration?.let { put("duration", it.milliseconds.toIsoString()) }
             if (repeatDays.isNotEmpty()) {
                 put("repeatDays", JsonPrimitive(repeatDays.joinToString(",")))
             }
@@ -75,6 +83,11 @@ private fun ItemMetadata.toFieldsJsonObject(): JsonObject {
             })
             errorMessage?.let { put("errorMessage", it) }
         }
+        is ItemMetadata.CalendarEvent -> buildJsonObject {
+            put("startTime", startTime.toEpochMilliseconds())
+            put("endTime", endTime.toEpochMilliseconds())
+            location?.let { put("location", it) }
+        }
         is ItemMetadata.Answer -> buildJsonObject {
             put("question", question)
         }
@@ -86,7 +99,11 @@ private fun ItemMetadata.toFieldsJsonObject(): JsonObject {
             put("toolName", toolName)
             put("success", success)
         }
+        is ItemMetadata.DelegatedToIntegration -> buildJsonObject {
+            put("integration", integration)
+        }
         ItemMetadata.Note -> JsonObject(emptyMap())
+        ItemMetadata.Checklist -> JsonObject(emptyMap())
     }
 }
 
@@ -135,6 +152,11 @@ fun metadataForKind(kind: String, existing: ItemMetadata? = null): ItemMetadata 
             sentAt = Clock.System.now(),
             status = ItemMetadata.Message.Status.Sent,
         )
+        "calendar_event" -> ItemMetadata.CalendarEvent(
+            startTime = Clock.System.now(),
+            endTime = Clock.System.now(),
+        )
+        "checklist" -> ItemMetadata.Checklist
         else -> ItemMetadata.Note
     }
 }

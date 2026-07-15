@@ -5,12 +5,13 @@ import coredevices.indexai.time.HumanDateTimeParser
 import coredevices.indexai.time.InterpretedDateTime
 import coredevices.indexai.util.JsonSnake
 import coredevices.mcp.BuiltInMcpTool
+import coredevices.mcp.SessionContext
+import coredevices.mcp.asFrozenClock
 import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
-import coredevices.ring.agent.currentSessionContext
-import coredevices.ring.database.room.repository.ItemRepository
+import coredevices.ring.agent.integrations.itemSource
+import coredevices.ring.data.entity.room.indexfeed.CachedList
 import coredevices.ring.database.room.repository.ListRepository
-import coredevices.ring.service.indexfeed.ItemFactory
 import io.modelcontextprotocol.kotlin.sdk.types.Tool
 import io.modelcontextprotocol.kotlin.sdk.types.ToolSchema
 import io.modelcontextprotocol.kotlin.sdk.types.toJson
@@ -62,15 +63,28 @@ class ListTool: BuiltInMcpTool(
         )
     )
 ), KoinComponent {
-    val reminderFactory: ReminderFactory by inject()
-    private val itemRepo: ItemRepository by inject()
-    private val itemFactory: ItemFactory by inject()
+    val reminderIntegrationFactory: ReminderIntegrationFactory by inject()
     private val listRepo: ListRepository by inject()
 
     companion object Companion {
         const val TOOL_NAME = "create_list_item"
-        const val TOOL_DESCRIPTION = "Create a new item in the user's list (e.g a shopping list, todo list) with an optional reminder time"
+        const val TOOL_DESCRIPTION = "Add an item to a shopping list, grocery list, or to-do list. Use when the user names a list or wants to buy groceries, food, or household supplies."
         private val logger = Logger.withTag(ReminderTool::class.simpleName!!)
+
+        /**
+         * Resolves a list-name hint from the model to a list's firestoreId.
+         * Prefers a title match (covers user-renamed and custom lists), then
+         * falls back to the stable seed marker so built-in lists keep resolving
+         * by their original keyword after a rename. The model is still prompted
+         * to use 'todo', which no longer matches the renamed "Reminders" title
+         * but does match its unchanged seed ("todos").
+         */
+        fun matchListIdByHint(lists: List<CachedList>, hint: String): String? {
+            val normalized = hint.trim().lowercase()
+            if (normalized.isEmpty()) return null
+            return lists.firstOrNull { it.title.lowercase().contains(normalized) }?.firestoreId
+                ?: lists.firstOrNull { it.seed?.lowercase()?.contains(normalized) == true }?.firestoreId
+        }
     }
 
     @Serializable
@@ -87,12 +101,32 @@ class ListTool: BuiltInMcpTool(
         val id: String? = null
     )
 
-    override suspend fun call(jsonInput: String): ToolCallResult {
+    override suspend fun call(jsonInput: String, context: SessionContext): ToolCallResult {
         val listItemArgs = JsonSnake.decodeFromString<ListItemArgs>(jsonInput)
         val instant = listItemArgs.reminder_date_time_human?.let {
             val tz = TimeZone.currentSystemDefault()
-            val parser = HumanDateTimeParser(timeZone = tz)
+            // Anchor time resolution to when the user actually spoke. When that's unknown, only
+            // absolute times can fall back to the current clock; relative ones are refused.
+            val timeBase = context.timeBase
+            val anchor = timeBase ?: Clock.System.now()
+            val parser = HumanDateTimeParser(clock = anchor.asFrozenClock(), timeZone = tz)
             val parsed = parser.parse(listItemArgs.reminder_date_time_human)
+            if (timeBase == null && parsed is InterpretedDateTime.Relative) {
+                return ToolCallResult(
+                    JsonSnake.encodeToString(
+                        ListAddResult(
+                            success = false,
+                            errorMessage = "Cannot resolve relative time '$it': the recording's " +
+                                    "original time is unknown. Use an absolute time, or create " +
+                                    "the item without a reminder time."
+                        )
+                    ),
+                    SemanticResult.GenericFailure(
+                        "Couldn't determine when the recording was made",
+                        llmRecoverable = true
+                    )
+                )
+            }
             when (parsed) {
                 is InterpretedDateTime.AbsoluteDate -> {
                     logger.d { "Parsed absolute date: $parsed will assume 9am" }
@@ -107,7 +141,7 @@ class ListTool: BuiltInMcpTool(
                 }
                 is InterpretedDateTime.AbsoluteTime -> {
                     logger.d { "Parsed absolute time: $parsed" }
-                    val currentTime = Clock.System.now().toLocalDateTime(tz)
+                    val currentTime = anchor.toLocalDateTime(tz)
                     if (parsed.time < currentTime.time) {
                         // If the time has already passed today, assume it's for tomorrow
                         logger.d { "Parsed time has already passed today, assuming it's for tomorrow" }
@@ -125,8 +159,7 @@ class ListTool: BuiltInMcpTool(
                 }
                 is InterpretedDateTime.Relative -> {
                     logger.d { "Parsed relative date time: $parsed" }
-                    val currentTime = Clock.System.now()
-                    (currentTime + parsed.duration).toLocalDateTime(tz)
+                    (anchor + parsed.duration).toLocalDateTime(tz)
                 }
                 null -> {
                     logger.e { "Failed to parse date time: '${listItemArgs.reminder_date_time_human}'" }
@@ -146,45 +179,24 @@ class ListTool: BuiltInMcpTool(
             }.toInstant(tz)
         }
 
-        val reminder = reminderFactory.create(
-            time = instant,
-            message = listItemArgs.message
-        )
         return try {
-            val reminderId = if (reminder is ListAssignableReminder) {
-                reminder.scheduleToList(listItemArgs.list_name)
-            } else {
-                reminder.schedule()
-            }
-            currentSessionContext()?.let { ctx ->
-                runCatching {
-                    val resolvedListId = resolveListIdByHint(listItemArgs.list_name)
-                    itemRepo.setItem(
-                        itemFactory.simpleUid(),
-                        itemFactory.noteItem(
-                            ctx.sourceRecordingId,
-                            ctx.createdAt,
-                            reminder.message,
-                            listItemArgs.list_name,
-                            resolvedListId = resolvedListId,
-                        )
-                    )
-                }
-            }
+            val integration = reminderIntegrationFactory.createReminderIntegration()
+            val list = integration.searchForList(listItemArgs.list_name).firstOrNull()
+            val reminderId = integration.createReminder(
+                listItemArgs.message,
+                instant,
+                listId = list?.id,
+                source = context.itemSource(),
+            )
+            val resolvedListId = runCatching { resolveListIdByHint(listItemArgs.list_name) }.getOrNull()
             ToolCallResult(
                 JsonSnake.encodeToString(ListAddResult(success = true, id = reminderId)),
-                if ((reminder as? ListAssignableReminder)?.listTitle != null) {
-                    SemanticResult.ListItemCreation(
-                        content = reminder.message,
-                        listUsed = reminder.listTitle,
-                        remindAt = reminder.time
-                    )
-                } else {
-                    SemanticResult.TaskCreation(
-                        title = reminder.message,
-                        deadline = reminder.time
-                    )
-                }
+                SemanticResult.ListItemCreation(
+                    content = listItemArgs.message,
+                    listUsed = list?.title,
+                    remindAt = instant,
+                    resolvedListId = resolvedListId,
+                )
             )
         } catch (e: Exception) {
             logger.e(e) { "Failed to create reminder" }
@@ -200,10 +212,6 @@ class ListTool: BuiltInMcpTool(
         }
     }
 
-    private suspend fun resolveListIdByHint(hint: String): String? {
-        val normalized = hint.trim().lowercase()
-        if (normalized.isEmpty()) return null
-        val lists = listRepo.getAllFlow().first()
-        return lists.firstOrNull { it.title.lowercase().contains(normalized) }?.firestoreId
-    }
+    private suspend fun resolveListIdByHint(hint: String): String? =
+        matchListIdByHint(listRepo.getAllFlow().first(), hint)
 }

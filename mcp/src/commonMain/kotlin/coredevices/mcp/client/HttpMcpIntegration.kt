@@ -2,6 +2,7 @@ package coredevices.mcp.client
 
 import co.touchlab.kermit.Logger
 import coredevices.mcp.McpTool
+import coredevices.mcp.SessionContext
 import coredevices.mcp.data.McpPrompt
 import coredevices.mcp.data.SemanticResult
 import coredevices.mcp.data.ToolCallResult
@@ -90,10 +91,15 @@ class HttpMcpIntegration(
 
     @OptIn(ExperimentalAtomicApi::class)
     override suspend fun connect() {
-        client.connect(transport)
-        connectionOpened = true
-        connectionLocks.incrementAndFetch()
-        logger.d { "Connected to MCP server: ${client.serverVersion}" }
+        if (connectionLocks.incrementAndFetch() > 1) return
+        try {
+            client.connect(transport)
+            connectionOpened = true
+            logger.d { "Connected to MCP server: ${client.serverVersion}" }
+        } catch (e: Throwable) {
+            connectionLocks.decrementAndFetch()
+            throw e
+        }
     }
 
     override suspend fun resetCache() {
@@ -141,7 +147,9 @@ class HttpMcpIntegration(
 
     override suspend fun callTool(
         toolName: String,
-        json: Map<String, JsonElement>
+        json: Map<String, JsonElement>,
+        // Session context is not forwarded to remote servers
+        context: SessionContext
     ): ToolCallResult {
         val result = client.callTool(toolName, json)
         if (result.isError == true) {
@@ -202,11 +210,11 @@ class HttpMcpIntegration(
         }
     }
 
-    override suspend fun getExtraContext(): String? {
+    override suspend fun getExtraContext(sessionContext: SessionContext?): String? {
         return client.serverInstructions
     }
 
-    override suspend fun getExtraContext(includePromptsFrom: Set<String>?): String? {
+    override suspend fun getExtraContext(sessionContext: SessionContext?, includePromptsFrom: Set<String>?): String? {
         val promptContext = includePromptsFrom?.mapNotNull { promptName ->
             try {
                 getPromptContent(promptName)

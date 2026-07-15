@@ -24,6 +24,12 @@ interface LocalReminderDao {
     @Query("SELECT * FROM LocalReminderData WHERE id = :id")
     suspend fun getReminder(id: Int): LocalReminderData?
 
+    @Query("UPDATE LocalReminderData SET recordingId = :recordingId WHERE id = :id")
+    suspend fun setRecordingId(id: Int, recordingId: String)
+
+    @Query("UPDATE LocalReminderData SET notifyBeforeMillis = NULL WHERE id = :id")
+    suspend fun clearNotifyBefore(id: Int)
+
     @Query("DELETE FROM LocalReminderData WHERE id = :id")
     suspend fun deleteReminder(id: Int)
 }

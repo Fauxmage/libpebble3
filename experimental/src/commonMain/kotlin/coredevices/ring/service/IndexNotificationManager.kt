@@ -24,6 +24,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -41,6 +42,8 @@ import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.flow.onEach
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.datetime.LocalDateTime
 import kotlinx.datetime.TimeZone
 import kotlinx.datetime.format
@@ -89,10 +92,13 @@ class IndexNotificationManager(
         private val logger = Logger.withTag("IndexNotificationManager")
         private const val DEEP_LINK_URI = "pebble://navbar/index"
         private val BUG_REPORT_DEBOUNCE = 1.minutes
+        private val PAIRING_ISSUE_DEBOUNCE = 30.minutes
     }
+    private val mapMutex = Mutex() // Guards the three mutable maps below
     private val inflightNotificationJobs = mutableMapOf<Long, Job?>()
     private val inflightNotifications = mutableMapOf<Long, InflightIndexNotification>()
     private var lastBugReportPrompt: Instant? = null
+    private var lastPairingIssuePrompt: Instant? = null
     private val transferToRecordingId = mutableMapOf<Long, Long?>()
 
 
@@ -112,7 +118,7 @@ class IndexNotificationManager(
         )
 
         when (transfer.status) {
-            RingTransferStatus.Started -> {
+            RingTransferStatus.Started, RingTransferStatus.Saving -> {
                 return InflightIndexNotification.Transferring(notifId, timestamp)
             }
             RingTransferStatus.Discarded -> {
@@ -214,16 +220,18 @@ class IndexNotificationManager(
             }
         }
     }
-    private fun nextNotificationId() = (inflightNotifications.values.maxByOrNull { it.id }?.id?.plus(1) ?: (10 + 1))
+    private suspend fun nextNotificationId() = mapMutex.withLock {
+        (inflightNotifications.values.maxByOrNull { it.id }?.id?.plus(1) ?: (10 + 1))
+    }
     @OptIn(FlowPreview::class)
     private suspend fun startNotificationJobFor(transfer: RingTransfer, scope: CoroutineScope) {
-        if (inflightNotificationJobs.containsKey(transfer.id)) {
+        if (mapMutex.withLock { inflightNotificationJobs.containsKey(transfer.id) }) {
             logger.d { "Notification job already exists for recording ${transfer.id}" }
             return
         }
 
         val id = transfer.id
-        inflightNotificationJobs[id] = scope.launch {
+        val job = scope.launch {
             platform.runWithBgTask("transfer_notif_${transfer.id}") {
                 ringTransferRepo.getTransferWithFeedItemFlow(transfer.id).filterNotNull().flatMapLatest {
                     val conv = it.ringTransfer?.recordingId?.let {conversationMessageDao.getMessagesForRecording(it) } ?: flowOf(null)
@@ -238,10 +246,11 @@ class IndexNotificationManager(
 
                     val lastEntry = rec?.entry
                     rec?.id?.let {
-                        transferToRecordingId[transfer.id] = it
+                        mapMutex.withLock { transferToRecordingId[transfer.id] = it }
                     }
+                    val notifId = mapMutex.withLock { inflightNotifications[id]?.id } ?: nextNotificationId()
                     val notif = makeInflightNotification(
-                        inflightNotifications[id]?.id ?: nextNotificationId(),
+                        notifId,
                         transfer,
                         lastEntry
                     )
@@ -254,8 +263,7 @@ class IndexNotificationManager(
                             else -> {}
                         }
                     }
-                    logger.d { "(Job ID ${currentCoroutineContext()[Job]?.hashCode()?.toHexString()}) Created notification for transfer ${transfer.id}: $notif" }
-                    inflightNotifications[transfer.id] = notif
+                    mapMutex.withLock { inflightNotifications[transfer.id] = notif }
 
                     notif
                 }
@@ -337,6 +345,16 @@ class IndexNotificationManager(
                                                     val time = lastAction.fireTime
                                                     appendLine("Alarm set for ${time.format(UITimeUtil.timeFormat())}")
                                                 }
+                                                is SemanticResult.CalendarEventCreation -> {
+                                                    val dateTime = lastAction.startTime.toLocalDateTime(
+                                                        TimeZone.currentSystemDefault()
+                                                    )
+                                                    val humanDate = UITimeUtil.humanDate(dateTime.date)
+                                                    val humanTime = dateTime.time.format(UITimeUtil.timeFormat())
+                                                    appendLine("Event added for ${humanDate}, ${humanTime}")
+                                                    appendLine()
+                                                    appendLine(lastAction.title)
+                                                }
                                                 is SemanticResult.TimerCreation -> {
                                                     val requested = lastAction.requestedDuration
                                                     val time = lastAction.fireTime.toLocalDateTime(TimeZone.currentSystemDefault())
@@ -352,6 +370,12 @@ class IndexNotificationManager(
                                                     } else {
                                                         appendLine(notification.userText)
                                                     }
+                                                }
+                                                is SemanticResult.Response -> {
+                                                    appendLine(lastAction.text)
+                                                }
+                                                is SemanticResult.MessageSent -> {
+                                                    appendLine(lastAction.text)
                                                 }
                                                 else -> {
                                                     appendLine(notification.userText)
@@ -418,7 +442,7 @@ class IndexNotificationManager(
                                 }
                             )
                         } else {
-                            inflightNotifications[transfer.id]?.id?.let { platformIndexNotificationManager.cancel(it) }
+                            mapMutex.withLock { inflightNotifications[transfer.id]?.id }?.let { platformIndexNotificationManager.cancel(it) }
                         }
 
                         if (
@@ -426,11 +450,13 @@ class IndexNotificationManager(
                             notification is InflightIndexNotification.Error ||
                             notification is InflightIndexNotification.Discarded
                         ) {
-                            inflightNotificationJobs.remove(id)?.cancel("Notification complete")
+                            mapMutex.withLock { inflightNotificationJobs.remove(id) }?.cancel("Notification complete")
                         }
                     }.onCompletion {
-                        inflightNotificationJobs.remove(id)
-                        val recordingId = transferToRecordingId[transfer.id]
+                        val recordingId = mapMutex.withLock {
+                            inflightNotificationJobs.remove(id)
+                            transferToRecordingId[transfer.id]
+                        }
                         val recordingIdTxt = recordingId?.let {
                             "recording $it"
                         } ?: "transfer $id"
@@ -442,9 +468,10 @@ class IndexNotificationManager(
                     }.collect()
             }
         }
+        mapMutex.withLock { inflightNotificationJobs[id] = job }
     }
 
-    fun sendBugReportPrompt(
+    suspend fun sendBugReportPrompt(
         title: String,
         content: String
     ) {
@@ -468,13 +495,15 @@ class IndexNotificationManager(
     }
 
 
+    @OptIn(FlowPreview::class)
     suspend fun startNotificationProcessingJob(scope: CoroutineScope) {
         val lastTimestamp = MutableStateFlow(ringTransferRepo.getMostRecentTransfer()?.createdAt ?: Instant.DISTANT_PAST)
 
         lastTimestamp.flatMapLatest {
             ringTransferRepo.getTransfersAfterFlow(it)
-        }.collect { transfers ->
-            transfers.forEach { startNotificationJobFor(it, scope) }
+        }.debounce(100).collect { transfers ->
+            transfers.filter { it.status != RingTransferStatus.Discarded }
+                .forEach { startNotificationJobFor(it, scope) }
             lastTimestamp.value = transfers
                 .maxByOrNull { it.createdAt }
                 ?.createdAt
@@ -482,7 +511,38 @@ class IndexNotificationManager(
         }
     }
 
-    suspend fun processRingSyncTransferNotifications(events: Flow<RingEvent>) {
+    suspend fun processRingSyncTransferNotifications(events: Flow<RingEvent>) = coroutineScope {
+        launch { processFirmwareUpdateNotifications(events) }
+        launch { processPairingIssueNotifications(events) }
+    }
+
+    // Leading-edge debounce: the ring scans continuously, so a lost pairing can be
+    // reported repeatedly. Notify once, then suppress repeats for a window.
+    private suspend fun processPairingIssueNotifications(events: Flow<RingEvent>) {
+        events.filterIsInstance<RingEvent.BluetoothPeerPairingIssue>()
+            .collect {
+                val now = Clock.System.now()
+                lastPairingIssuePrompt?.let { last ->
+                    if (now - last < PAIRING_ISSUE_DEBOUNCE) {
+                        logger.d { "Skipping pairing issue notification; last sent at $lastPairingIssuePrompt" }
+                        return@collect
+                    }
+                }
+                lastPairingIssuePrompt = now
+                platformIndexNotificationManager.notify(
+                    GenericNotification(
+                        id = nextNotificationId(),
+                        title = "Index 01 Pairing Issue",
+                        contentText = "Your Index 01 requires re-pairing to function correctly.",
+                        inProgress = null,
+                        localOnly = false,
+                        deepLink = DEEP_LINK_URI
+                    )
+                )
+            }
+    }
+
+    private suspend fun processFirmwareUpdateNotifications(events: Flow<RingEvent>) {
         var inProgressUpdate: GenericNotification? = null
         events.filterIsInstance<RingEvent.FirmwareUpdate>()
             .collect {

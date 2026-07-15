@@ -28,22 +28,30 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyItemScope
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.PageSize
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import coredevices.ring.ui.components.feed.TodoCheckCircle
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
@@ -60,7 +68,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.snapshotFlow
@@ -74,7 +81,9 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -85,9 +94,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import coredevices.indexai.data.entity.LocalRecording
+import coredevices.indexai.data.entity.RecordingEntryEntity
 import coredevices.ring.data.entity.room.indexfeed.CachedItem
 import coredevices.ring.data.entity.room.indexfeed.CachedList
 import coredevices.ring.data.entity.room.indexfeed.kind
+import coredevices.ring.data.entity.room.indexfeed.displayTitle
+import coredevices.ring.service.RingSync
 import coredevices.ring.service.indexfeed.DefaultListsBootstrap.Companion.LIST_TODOS_ID
 import coredevices.ring.ui.components.chat.IndexComposeBarHost
 import coredevices.ring.ui.navigation.RingRoutes
@@ -96,11 +108,13 @@ import coredevices.ring.ui.theme.IndexThemeHost
 import coredevices.ring.ui.theme.indexTextEntryStyle
 import coredevices.ring.ui.viewmodel.IndexFeedViewModel
 import kotlin.time.Clock
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.ExperimentalTime
 import kotlin.time.Instant
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import org.koin.compose.koinInject
 import org.koin.compose.viewmodel.koinViewModel
 import kotlin.math.abs
 
@@ -119,6 +133,7 @@ internal fun IndexHeader(
     val colors = IndexTheme.colors
     val searchFocus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
+    val focusManager = LocalFocusManager.current
     LaunchedEffect(searching) {
         if (searching) {
             searchFocus.requestFocus()
@@ -150,6 +165,10 @@ internal fun IndexHeader(
                     textStyle = TextStyle(color = colors.onSurface, fontSize = 15.sp).indexTextEntryStyle(),
                     cursorBrush = SolidColor(colors.primary),
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = {
+                        focusManager.clearFocus()
+                        keyboard?.hide()
+                    }),
                     decorationBox = { inner ->
                         if (query.isEmpty()) {
                             Text("Search…", color = colors.onSurfaceVariant, fontSize = 15.sp)
@@ -171,15 +190,29 @@ internal fun IndexHeader(
                 modifier = Modifier.clickable { onCancelSearch() }.padding(6.dp),
             )
         } else {
-            Text(
-                "Index",
-                color = colors.onSurface,
-                fontSize = 28.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = (-0.8).sp,
-                modifier = Modifier.weight(1f).padding(horizontal = 8.dp, vertical = 4.dp),
-            )
-            PulsingSyncHint()
+            // Wrap title + sync hint in a weighted Row so the trailing
+            // icon buttons are always given their natural width first
+            // (protects them under large font scaling / narrow devices).
+            // Within the cluster, the title renders at natural width with
+            // no wrap so "Index" never squishes, and the sync hint absorbs
+            // any leftover space, right-aligning and truncating with an
+            // ellipsis when the row gets tight.
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Index",
+                    color = colors.onSurface,
+                    fontSize = 28.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = (-0.8).sp,
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+                PulsingSyncHint(modifier = Modifier.weight(1f))
+            }
             IconButton(onClick = onStartSearch) {
                 Icon(Icons.Default.Search, "Search", tint = colors.onSurfaceVariant, modifier = Modifier.size(20.dp))
             }
@@ -189,26 +222,59 @@ internal fun IndexHeader(
 }
 
 @Composable
-internal fun PulsingSyncHint() {
+internal fun PulsingSyncHint(modifier: Modifier = Modifier) {
     val colors = IndexTheme.colors
-    var alpha by remember { mutableFloatStateOf(0.45f) }
-    LaunchedEffect(Unit) {
-        var rising = true
+    val lastSyncedAt by koinInject<RingSync>().lastSyncedAt.collectAsState()
+
+    // Re-evaluate on a slow tick so the relative label ages ("just now" →
+    // "5m ago") and flips back to the pulsing prompt once the sync goes stale.
+    var now by remember { mutableStateOf(Clock.System.now()) }
+    LaunchedEffect(lastSyncedAt) {
         while (true) {
-            delay(40)
-            alpha += if (rising) 0.04f else -0.04f
-            if (alpha >= 1f) { alpha = 1f; rising = false }
-            if (alpha <= 0.45f) { alpha = 0.45f; rising = true }
+            now = Clock.System.now()
+            delay(1.minutes)
         }
     }
-    Text(
-        "Click ring to sync",
-        color = colors.onSurfaceVariant,
-        fontSize = 12.sp,
-        letterSpacing = (-0.05).sp,
-        modifier = Modifier.alpha(alpha).padding(end = 4.dp),
-    )
+
+    val synced = lastSyncedAt
+    if (synced != null && now - synced < SYNC_HINT_FRESH_WINDOW) {
+        Text(
+            "Last synced ${relativeTime(synced)}",
+            color = colors.onSurfaceVariant,
+            fontSize = 12.sp,
+            letterSpacing = (-0.05).sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+            modifier = modifier.padding(end = 4.dp),
+        )
+    } else {
+        val transition = rememberInfiniteTransition(label = "sync-hint-pulse")
+        val alpha by transition.animateFloat(
+            initialValue = 0.45f,
+            targetValue = 1f,
+            animationSpec = infiniteRepeatable(
+                animation = tween(durationMillis = 550, easing = LinearEasing),
+                repeatMode = RepeatMode.Reverse,
+            ),
+            label = "sync-hint-alpha",
+        )
+        Text(
+            "Click ring to sync",
+            color = colors.onSurfaceVariant,
+            fontSize = 12.sp,
+            letterSpacing = (-0.05).sp,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            textAlign = TextAlign.End,
+            modifier = modifier.alpha(alpha).padding(end = 4.dp),
+        )
+    }
 }
+
+/** Show "Last synced …" instead of the "Click ring to sync" prompt while
+ *  the most recent ring sync is newer than this. */
+private val SYNC_HINT_FRESH_WINDOW = 30.minutes
 
 /**
  * The peek section header (Index feed) gets a red count chip and a red
@@ -296,6 +362,7 @@ internal fun FeedSectionHeader(
 internal fun PeekStrip(
     peeks: List<IndexFeedViewModel.UiState.RecordingPeek>,
     onOpenRecording: (LocalRecording) -> Unit,
+    onRetryRecording: (LocalRecording, RecordingEntryEntity) -> Unit,
 ) {
     val visiblePeeks = peeks.take(5)
     val firstId = visiblePeeks.firstOrNull()?.recording?.id
@@ -328,6 +395,7 @@ internal fun PeekStrip(
             PeekCard(
                 peek = peek,
                 onClick = { onOpenRecording(peek.recording) },
+                onRetry = { peek.retryEntry?.let { onRetryRecording(peek.recording, it) } },
                 modifier = Modifier.animateItem(
                     fadeInSpec = spring(stiffness = Spring.StiffnessMediumLow),
                     placementSpec = spring(
@@ -345,6 +413,7 @@ internal fun PeekStrip(
 internal fun PeekCard(
     peek: IndexFeedViewModel.UiState.RecordingPeek,
     onClick: () -> Unit,
+    onRetry: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val colors = IndexTheme.colors
@@ -388,28 +457,60 @@ internal fun PeekCard(
             overflow = TextOverflow.Ellipsis,
         )
         Spacer(Modifier.weight(1f)) // pushes chip text to the bottom of the fixed-height card
-        Row(
-            modifier = Modifier.height(16.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(modifier = Modifier.size(14.dp), contentAlignment = Alignment.Center) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowForward,
-                    contentDescription = null,
-                    tint = if (peek.orphan) colors.onSurfaceVariant else colors.primary,
-                    modifier = Modifier.size(13.dp),
+        if (peek.retryEntry != null) {
+            // Transcription failed — surface the error and a retry affordance
+            // in place of the action chip.
+            Row(
+                modifier = Modifier.height(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    "Transcription error",
+                    color = colors.error,
+                    fontSize = 11.sp,
+                    lineHeight = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    "Retry",
+                    color = colors.primary,
+                    fontSize = 11.sp,
+                    lineHeight = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(percent = 50))
+                        .clickable { onRetry() }
+                        .padding(horizontal = 6.dp, vertical = 1.dp),
                 )
             }
-            Spacer(Modifier.width(4.dp))
-            Text(
-                peek.primaryChip,
-                color = if (peek.orphan) colors.onSurfaceVariant else colors.primary,
-                fontSize = 11.sp,
-                lineHeight = 13.sp,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+        } else {
+            Row(
+                modifier = Modifier.height(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(modifier = Modifier.size(14.dp), contentAlignment = Alignment.Center) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowForward,
+                        contentDescription = null,
+                        tint = if (peek.orphan) colors.onSurfaceVariant else colors.primary,
+                        modifier = Modifier.size(13.dp),
+                    )
+                }
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    peek.primaryChip,
+                    color = if (peek.orphan) colors.onSurfaceVariant else colors.primary,
+                    fontSize = 11.sp,
+                    lineHeight = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
         }
     }
 }
@@ -425,15 +526,21 @@ internal fun TaskRow(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { onClick() }
+                // Locked rows can't be opened/edited (no key to decrypt) — a
+                // write would clobber the cloud ciphertext with cleartext.
+                .let { if (task.locked) it else it.clickable { onClick() } }
                 .padding(horizontal = 22.dp, vertical = 8.dp),
             verticalAlignment = Alignment.Top,
         ) {
-            TodoCheckCircle(
-                done = task.done,
-                onToggle = onToggle,
-                modifier = Modifier.padding(top = 1.dp),
-            )
+            if (task.locked) {
+                Text("🔒", fontSize = 15.sp, modifier = Modifier.padding(top = 1.dp))
+            } else {
+                TodoCheckCircle(
+                    done = task.done,
+                    onToggle = onToggle,
+                    modifier = Modifier.padding(top = 1.dp),
+                )
+            }
             Spacer(Modifier.width(12.dp))
             // Strike-through + faded look while the row lingers post-toggle
             // (the row is dropped from the list ~600 ms later by the
@@ -450,7 +557,7 @@ internal fun TaskRow(
                     .graphicsLayer { alpha = rowAlpha },
             ) {
                 Text(
-                    task.title,
+                    task.displayTitle,
                     color = colors.onSurface,
                     fontSize = 15.sp,
                     fontWeight = FontWeight.Medium,
@@ -489,39 +596,44 @@ internal fun LazyListScope.todosCarousel(
     onOpen: (CachedItem) -> Unit,
 ) {
     val pages = todos.chunked(IndexFeedViewModel.TODO_PAGE_SIZE)
+    if (pages.isEmpty()) return
     item("todos-pages") {
+        // HorizontalPager (compose-foundation) gives us the standard
+        // snap-during-fling behaviour out of the box: when the user
+        // releases mid-swipe the page settles immediately at the nearest
+        // boundary using the same fling physics as the system.
+        // The previous implementation waited for `isScrollInProgress`
+        // to flip to false (i.e. fling fully stopped) and then ran a
+        // separate animateScrollToItem — a two-stage motion that felt
+        // slow and jerky on release.
         BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+            // 36dp of next-page peek visible at the right edge so the
+            // user knows there's more. Identical visual to the old
+            // implementation, just driven by a real pager.
             val pageWidth = maxWidth - 36.dp
-            val listState = rememberLazyListState()
-            SnapToNearestPage(listState = listState, pageCount = pages.size)
-            LazyRow(
-                state = listState,
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(end = 36.dp, top = 2.dp, bottom = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(items = pages, key = { page -> page.first().firestoreId }) { page ->
-                    Column(modifier = Modifier.width(pageWidth)) {
-                        page.forEach { task ->
-                            TaskRow(
-                                task = task,
-                                onToggle = { onToggle(task) },
-                                onClick = { onOpen(task) },
-                            )
-                        }
-                        // No empty-row padding here. The previous version
-                        // padded short pages to PAGE_SIZE rows so every
-                        // page rendered at the same height — but the
-                        // 42dp spacer height was taller than the actual
-                        // TaskRow, so a partial page (e.g. 3 of 6 todos)
-                        // ended up TALLER than a full page, and the
-                        // LazyRow's wrapContent height locked to the
-                        // taller value. Result: 50–80dp of dead space
-                        // visible BELOW page 1 (the full one). Letting
-                        // the LazyRow size to the full page is the right
-                        // behaviour — partial pages just have empty
-                        // space below their content when scrolled to.
+            val pagerState = rememberPagerState(pageCount = { pages.size })
+            HorizontalPager(
+                state = pagerState,
+                pageSize = PageSize.Fixed(pageWidth),
+                pageSpacing = 8.dp,
+                contentPadding = PaddingValues(end = 36.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp, bottom = 10.dp),
+            ) { pageIndex ->
+                val page = pages[pageIndex]
+                Column {
+                    page.forEach { task ->
+                        TaskRow(
+                            task = task,
+                            onToggle = { onToggle(task) },
+                            onClick = { onOpen(task) },
+                        )
                     }
+                    // Intentionally NO empty-row spacers. Pager pages can
+                    // have natural heights; the pager wraps to the
+                    // tallest page. A partial last page just shows empty
+                    // space below its content when scrolled to.
                 }
             }
         }
@@ -588,41 +700,44 @@ internal fun LazyListScope.notesGrid(
         }
         BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
             // 22dp leading edge to align with the rest of the home feed,
-            // ~32dp peek of the next page on the trailing edge.
+            // ~32dp peek of the next page on the trailing edge. Driven
+            // by HorizontalPager so swipe physics match the system snap
+            // behaviour (snaps mid-fling rather than after-fling).
             val pageWidth = maxWidth - 22.dp - 32.dp - 10.dp
-            val listState = rememberLazyListState()
-            SnapToNearestPage(listState = listState, pageCount = pages.size)
-            LazyRow(
-                state = listState,
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(start = 22.dp, end = 32.dp, top = 2.dp, bottom = 10.dp),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-            ) {
-                items(items = pages, key = { page -> page.first().list.firestoreId }) { page ->
-                    Column(modifier = Modifier.width(pageWidth)) {
-                        repeat(2) { rowIndex ->
-                            val row = page.drop(rowIndex * 2).take(2)
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 5.dp),
-                                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                            ) {
-                                row.forEach { entry ->
-                                    Box(modifier = Modifier.weight(1f)) {
-                                        ListCard(
-                                            entry = entry,
-                                            onClick = { onOpen(entry.list) },
-                                        )
-                                    }
+            val pagerState = rememberPagerState(pageCount = { pages.size })
+            HorizontalPager(
+                state = pagerState,
+                pageSize = PageSize.Fixed(pageWidth),
+                pageSpacing = 10.dp,
+                contentPadding = PaddingValues(start = 22.dp, end = 32.dp),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 2.dp, bottom = 10.dp),
+            ) { pageIndex ->
+                val page = pages[pageIndex]
+                Column {
+                    repeat(2) { rowIndex ->
+                        val row = page.drop(rowIndex * 2).take(2)
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 5.dp),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            row.forEach { entry ->
+                                Box(modifier = Modifier.weight(1f)) {
+                                    ListCard(
+                                        entry = entry,
+                                        onClick = { onOpen(entry.list) },
+                                    )
                                 }
-                                if (row.size == 1) {
-                                    Spacer(modifier = Modifier.weight(1f))
-                                }
-                                if (row.isEmpty()) {
-                                    Spacer(modifier = Modifier.weight(1f).height(NOTES_EMPTY_ROW_HEIGHT))
-                                    Spacer(modifier = Modifier.weight(1f).height(NOTES_EMPTY_ROW_HEIGHT))
-                                }
+                            }
+                            if (row.size == 1) {
+                                Spacer(modifier = Modifier.weight(1f))
+                            }
+                            if (row.isEmpty()) {
+                                Spacer(modifier = Modifier.weight(1f).height(NOTES_EMPTY_ROW_HEIGHT))
+                                Spacer(modifier = Modifier.weight(1f).height(NOTES_EMPTY_ROW_HEIGHT))
                             }
                         }
                     }
@@ -633,22 +748,6 @@ internal fun LazyListScope.notesGrid(
 }
 
 private val NOTES_EMPTY_ROW_HEIGHT = 124.dp
-
-@Composable
-private fun SnapToNearestPage(listState: LazyListState, pageCount: Int) {
-    LaunchedEffect(listState, pageCount) {
-        snapshotFlow { listState.isScrollInProgress }
-            .distinctUntilChanged()
-            .collect { scrolling ->
-                if (scrolling || pageCount <= 1) return@collect
-                val nearest = listState.layoutInfo.visibleItemsInfo
-                    .minByOrNull { abs(it.offset) }
-                    ?.index
-                    ?: listState.firstVisibleItemIndex
-                listState.animateScrollToItem(nearest.coerceIn(0, pageCount - 1))
-            }
-    }
-}
 
 @Composable
 internal fun ListCard(
@@ -685,16 +784,20 @@ fun NoteListCard(
             .clip(RoundedCornerShape(14.dp))
             .background(colors.surfaceContainerLow)
             .border(1.dp, colors.outlineVariant, RoundedCornerShape(14.dp))
-            .clickable { onClick() }
+            // A locked list can't be opened — its title and items are encrypted.
+            .let { if (list.locked) it else it.clickable { onClick() } }
             .padding(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            if (icon.isNotEmpty()) {
+            if (list.locked) {
+                Text(text = "🔒", fontSize = 16.sp)
+                Spacer(Modifier.width(6.dp))
+            } else if (icon.isNotEmpty()) {
                 Text(text = icon, fontSize = 16.sp)
                 Spacer(Modifier.width(6.dp))
             }
             Text(
-                list.title.ifBlank { "List" },
+                list.displayTitle.ifBlank { "List" },
                 color = colors.onSurface,
                 fontSize = 14.sp,
                 fontWeight = FontWeight.SemiBold,
@@ -719,12 +822,26 @@ fun NoteListCard(
                 // title — Compose baseline-aligns Text composables in a Row by
                 // default, so "○ Dried mangoes" reads cleanly without manual
                 // top padding (which an Icon would need to fudge).
+                //
+                // The glyph reflects the **item's own kind** first, so a
+                // mixed list (a Notes-to-self list that has both notes and
+                // a couple of checklist items in it) renders correctly:
+                // checklist items always get "○", notes always get "−",
+                // regardless of the parent list's listKind. We fall back
+                // to the parent listKind only when the item kind isn't
+                // one of those two (shouldn't happen in practice — the
+                // Notes filter upstream is `note || checklist`).
                 Row(
                     verticalAlignment = Alignment.Top,
                     modifier = Modifier.padding(top = 2.dp),
                 ) {
+                    val glyph = when (item.kind) {
+                        "checklist" -> "○"
+                        "note" -> "−"
+                        else -> if (isChecklist) "○" else "−"
+                    }
                     Text(
-                        if (isChecklist) "○" else "−",
+                        glyph,
                         color = colors.onSurfaceVariant,
                         fontSize = 12.sp,
                         lineHeight = 15.sp,
@@ -769,9 +886,10 @@ internal fun AnswerCard(answer: CachedItem, onClick: () -> Unit) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        if (answer.body.isNotBlank()) {
+        val sanitizedBody = answer.body.replace(Regex("<[^>]*>"), "").trim()
+        if (sanitizedBody.isNotBlank()) {
             Text(
-                answer.body,
+                sanitizedBody,
                 color = colors.onSurfaceVariant,
                 fontSize = 12.5.sp,
                 lineHeight = 17.5.sp,

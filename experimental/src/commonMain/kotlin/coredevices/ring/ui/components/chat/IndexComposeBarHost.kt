@@ -1,17 +1,14 @@
 package coredevices.ring.ui.components.chat
 
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
 import co.touchlab.kermit.Logger
+import coredevices.libindex.di.LibIndexCoroutineScope
 import coredevices.ring.service.recordings.RecordingProcessingQueue
 import coredevices.ring.storage.RecordingStorage
 import coredevices.ring.util.AudioRecorder
@@ -47,6 +44,7 @@ fun IndexComposeBarHost(
 ) {
     val scope = rememberCoroutineScope()
     val koin = getKoin()
+    val appScope = koinInject<LibIndexCoroutineScope>()
     val recordingStorage = koinInject<RecordingStorage>()
     val recordingQueue = koinInject<RecordingProcessingQueue>()
     val permissionRequester = koinInject<PermissionRequester>()
@@ -81,7 +79,7 @@ fun IndexComposeBarHost(
             try {
                 recorder.use { rec ->
                     val source = rec.startRecording()
-                    val sink = recordingStorage.openRecordingSink(fileId, rec.sampleRate, "audio/raw")
+                    val sink = recordingStorage.openOriginalRecordingSink(fileId, rec.sampleRate, "audio/raw")
                     withContext(Dispatchers.IO) {
                         source.use {
                             sink.use {
@@ -101,18 +99,20 @@ fun IndexComposeBarHost(
     }
 
     fun stopAndProcess() {
-        scope.launch {
+        // appScope: once the user taps stop, saving + queueing the finished
+        // recording must survive this composable leaving composition.
+        appScope.launch {
             val fileId = currentFileId ?: return@launch
             currentRecorder?.stopRecording()
             recordingJob?.join()
             logger.i { "Stopped recording, queueing: $fileId" }
             withContext(Dispatchers.IO) {
-                val (source, info) = recordingStorage.openRecordingSource(fileId)
-                val cleanSink = recordingStorage.openCleanRecordingSink(
+                val (source, info) = recordingStorage.openRecordingSource(fileId, useOriginalAudio = true)
+                val processedSink = recordingStorage.openRecordingSink(
                     fileId, info.cachedMetadata.sampleRate, info.cachedMetadata.mimeType,
                 )
                 source.use { src ->
-                    cleanSink.buffered().use { dst ->
+                    processedSink.buffered().use { dst ->
                         src.transferTo(dst)
                     }
                 }

@@ -19,6 +19,7 @@ actual fun PebbleWebview(
     interceptor: PebbleWebviewUrlInterceptor,
     modifier: Modifier,
     onPageFinishedJavaScript: String?,
+    onPageError: ((message: String) -> Unit)?,
 ) {
     val state = rememberWebViewState(url)
 
@@ -27,6 +28,11 @@ actual fun PebbleWebview(
             isJavaScriptEnabled = true
             androidWebSettings.apply {
                 domStorageEnabled = true
+                // Let WebView read the Activity's theme (set by MainActivity.setTheme based on the
+                // in-app App Theme) for prefers-color-scheme, instead of falling back to the OS
+                // Configuration.uiMode. Requires WebView component ~102+; older components fall
+                // back to OS-driven dark mode.
+                isAlgorithmicDarkeningAllowed = true
             }
         }
         onDispose { }
@@ -50,6 +56,10 @@ actual fun PebbleWebview(
                         return false
                     }
                 }
+
+                override fun reload() {
+                    navigator.reload()
+                }
             }
             interceptor.navigator = pebbleNavigator
             return if (interceptor.onIntercept(request.url, pebbleNavigator)) {
@@ -65,6 +75,14 @@ actual fun PebbleWebview(
     LaunchedEffect(state.loadingState, onPageFinishedJavaScript) {
         if (state.loadingState is LoadingState.Finished && onPageFinishedJavaScript != null) {
             navigator.evaluateJavaScript(onPageFinishedJavaScript)
+        }
+    }
+
+    // Surface main-frame load failures (cleared automatically when a new request starts).
+    val mainFrameError = state.errorsForCurrentRequest.firstOrNull { it.isFromMainFrame }
+    LaunchedEffect(mainFrameError) {
+        if (mainFrameError != null) {
+            onPageError?.invoke(mainFrameError.description)
         }
     }
     
